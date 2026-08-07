@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Tokenized corpora: rebuild with tokenize_data.py. Gigabytes, never committed.
+*.bin
+*.bin.tmp
+
+# Model weights, including per-run checkpoints under runs/.
+# GitHub caps files at 100 MB and the released checkpoint is 538 MB.
+*.pth
+*.pt
+
+# The rest of a run folder (config.json, metrics.jsonl, summary.json,
+# loss_curve.png) IS committed. Those files are the provenance record and the
+# whole reason runs/ exists.
+
+# OS
+.DS_Store
+Thumbs.db

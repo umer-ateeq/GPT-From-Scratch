@@ -1,0 +1,17 @@
+# Core: model, training, evaluation
+torch>=2.1          # torch.amp autocast/GradScaler API
+numpy>=1.24
+tiktoken>=0.5       # GPT-2 BPE, 50257 vocab
+
+# Building and loading datasets (tokenize_data.py, evaluate.py --mode wikitext)
+datasets>=2.14
+tqdm>=4.65
+
+# Loss curves. train.py degrades gracefully without it.
+matplotlib>=3.7
+
+# Only for the GPT-2-small baseline: evaluate.py --model gpt2
+transformers>=4.35
+
+# Tests
+pytest>=7.0
