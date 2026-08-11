@@ -120,19 +120,22 @@ model, not of my evaluation code.
 
 ## 4. Reading the training run out of the weights
 
-The checkpoint is a bare `state_dict`: 117 tensors, no config, no metadata,
-nothing but numbers. Every entry in the training table above is recoverable from
-those tensors. A config file records what a run intended. The weights record what
-it did, and where the two disagree the weights are the artifact you ship.
+The checkpoint is a bare `state_dict`: 117 tensors, no config, no metadata. Every
+number in the training table above came back out of those tensors.
 
 ```bash
 python interp/audit_checkpoint.py --ckpt weights8b_300epoch.pth
 ```
 
-**The trained context, from the positional table.** A row of `pos_emb.weight` only
-receives gradient if a batch reached that position, but AdamW decays every
-parameter on every step regardless. So untrained rows shrink geometrically while
-trained rows hold their norm, and the boundary is legible directly:
+The model has 256 positional rows. The run used 128. So half of `pos_emb.weight` got
+weight decay on every step and gradient on none. Those rows are a recording of the
+run, and two numbers come out of them.
+
+### The trained context is 128
+
+A positional row gets a gradient only if a batch reaches that position. AdamW decays
+it either way. So rows the run never reached shrink toward zero, and rows it reached
+hold their norm.
 
 ```
    positions  0-31   32-63   64-95  96-127 | 128-159 160-191 192-223 224-255
@@ -141,41 +144,42 @@ trained rows hold their norm, and the boundary is legible directly:
 
 ![Positional embedding row norms, a 93x cliff exactly at position 128](images/pos_emb_norms.png)
 
-A **93x cliff exactly at position 128** across 256 allocated rows. That is why every
-perplexity here is quoted at 128: scoring at 256 puts half of each window on rows
-that never trained and roughly doubles perplexity, 38.89 to 74.70 on identical data.
-`evaluate.py` reads this from the weights and warns before printing a number.
+A **93x cliff, exactly at position 128**. This sets the evaluation context. The same
+data scored at 256 gives 74.70 instead of 38.89, and all of that gap is measurement
+error, so `evaluate.py` reads the cliff off the weights and warns before printing.
 
-**The optimizer step count, from the same rows.** Those dead rows are a clock. They
-took decay and no gradient, so their total shrinkage integrates the learning rate
-across the run, and because the rate was constant that integral is a count.
-Initialization is `nn.Embedding` default N(0,1), so a fresh 768-dimensional row has
-expected norm `sqrt(768) = 27.71`:
+### The run took 234,478 optimizer steps
+
+Those 128 rows were multiplied by the same decay factor on every step that landed.
+Multiply it out and the shrinkage counts the steps. `nn.Embedding` starts from
+N(0,1), so a fresh row of width 768 has norm `sqrt(768) = 27.71`:
 
 ```
 final = initial x (1 - lr x weight_decay)^N
 
 0.002346 / 27.7765 = 8.448e-5
-ln(8.448e-5) / ln(1 - 4e-4 x 0.1) = 234,478 optimizer steps
+ln(8.448e-5) / ln(1 - 4e-4 x 0.1) = 234,478 steps
 ```
 
-**Three routes to the same answer, two of which never read the source code:**
+Three routes agree, and two never read the source code:
 
 | Route | Reads | Result |
 |---|---|---|
-| Weight-decay clock on `pos_emb` rows 128-255 | the weights | 234,478 steps |
-| 517 never-sampled `tok_emb` rows at the same floor | a **disjoint** parameter subspace | 227,000 to 236,600 steps |
+| Decay clock on `pos_emb` rows 128-255 | the weights | 234,478 steps |
+| 517 never-sampled `tok_emb` rows at the same floor | a **different** part of the weights | 227,000 to 236,600 steps |
 | Training loop counts, 300 cycles x 1000 batches | the source | 300,000 steps, 1.23B tokens |
 
-The two weight-based routes bracket each other to within a few thousand steps,
-measured in parameter subspaces that share no parameters. Both sit 22% below the
-loop count, which is the `GradScaler` skip rate: a step skipped on fp16 overflow
-runs forward and backward but applies no update and no decay. So the clock counts
-steps that changed the weights and is a lower bound on steps attempted.
+The two weight-based routes share no parameters and agree to within a few thousand
+steps out of 234,000. Both come in 22% under the loop count, which is the
+`GradScaler` skip rate: a step skipped on fp16 overflow still runs forward and
+backward, but applies no update and no decay. The clock counts steps that changed
+the weights.
 
-**The controls.** The method assumes those rows are untouched initialization that
-was only scaled down, not rows that trained and then decayed. Two properties
-separate those cases, and both check out:
+### The controls
+
+This only works if those rows are untouched initialization that was scaled down, not
+rows that trained and then decayed. Training pulls neighbouring rows into alignment
+and spreads their norms. Scaling does neither.
 
 | | Norm spread (std/mean) | Adjacent-row cosine |
 |---|---|---|
@@ -183,98 +187,92 @@ separate those cases, and both check out:
 | **Checkpoint rows 128-255** | **2.72%** | **0.028** |
 | Checkpoint rows 0-127 (trained) | 23.10% | 0.822 |
 
-The dead rows kept their random directions and their even norms. They were scaled,
-not trained. The 2.75% figure is also what theory predicts: the relative standard
-deviation of the norm of a 768-dimensional Gaussian vector is `1/sqrt(2 x 768) =
-2.6%`. `tests/test_interpretability.py` plants a synthetic cliff in a fresh model
-and asserts the audit recovers it, so the detector is tested against a known answer.
+Both numbers match fresh initialization and are nowhere near the trained rows. 2.75%
+is also what theory gives: for a random vector of width 768 the norm varies by
+`1/sqrt(2 x 768) = 2.6%`. `tests/` plants a fake cliff in a fresh model and checks
+that the audit finds it, so the detector has been tested against a known answer.
 
-Full method, the failure modes, and what the clock cannot establish:
-**[interp/CHECKPOINT_AUDIT.md](interp/CHECKPOINT_AUDIT.md)**.
+Full method and limits: **[interp/CHECKPOINT_AUDIT.md](interp/CHECKPOINT_AUDIT.md)**.
 
 ## 5. Reading the circuit out of the weights
 
 Same method, harder question. Section 4 asked what the weights say about the *run*.
 This asks what they say about the *computation*.
 
-An induction head implements one rule: *"I have seen this token before. What came
-next last time? Attend to that."* It is the leading mechanistic account of
-in-context learning (Olsson et al., 2022). The question was whether a 134M model
-trained on a free GPU at context 128 forms one at all.
+An induction head follows one rule: *"I have seen this token before. What came next
+last time? Attend to that."* It is the leading account of in-context learning
+(Olsson et al., 2022). The question: does a 134M model trained on a free GPU at
+context 128 build one at all.
 
-**Technique 1: attention probing.** Feed the model a random sequence repeated twice
-and measure where each of the 96 heads looks. **Random tokens are the point**: the
-model cannot fall back on memorized English, so any copying comes from the context.
-16 sequences. A causal head at position `i` spreads attention over `i + 1` positions,
-so an indifferent head puts `1/(i+1)` on any single one, which averages to the
-**uniform baseline of 0.0142** across the measured queries. A head scoring 1x is
-doing nothing.
+### Two heads out of 96 do induction
+
+Feed the model a random sequence repeated twice and measure where every head looks.
+**Random tokens are the point.** The model cannot fall back on memorized English, so
+any copying has to come from the context. A causal head at position `i` splits its
+attention over `i + 1` positions, so a head with no preference puts `1/(i+1)` on any
+one of them. Averaged over the measured queries that is **0.0142**, the baseline
+below. 16 sequences.
 
 ![Induction score by head](images/induction_heads.png)
 
-| Head | Attention on the induction target | vs uniform |
+| Head | Attention on the induction target | vs baseline |
 |---|---|---|
 | **L6.H9** | **0.4188** | **29.5x** |
 | **L7.H8** | **0.2738** | **19.3x** |
 | L6.H7 | 0.0864 | 6.1x |
 | everything else | ~0.014 | ~1x |
 
-`L6.H9` puts **42% of its attention on a single position** out of fifty plus. Three
-things it could have been instead, and is not:
+`L6.H9` puts **42% of its attention on one position** out of fifty plus. Three things
+it could have been instead, and is not:
 
-- **A duplicate-token head**, which notices repetition without predicting. L6.H9 puts
-  0.4188 on the *next* token against 0.0136 on the *same* token, a factor of **31**.
-- **A fixed positional offset.** This model has learned absolute positions, so a head
-  keyed to a constant offset is expressible and would score identically at a fixed
-  repeat period. Varying the period across 32, 48 and 56 moves the score by **8%**,
-  where a fixed-offset head would collapse everywhere except one value.
-- **An artifact of the probe.** The same probe on an untrained model returns ~1x
-  uniform across all 96 heads, which `tests/test_interpretability.py` asserts. The
-  probe is not measuring itself.
+| Alternative | Ruled out by |
+|---|---|
+| A duplicate-token head, which spots repeats without predicting | 0.4188 on the **next** token against 0.0136 on the **same** token, a factor of **31** |
+| A fixed positional offset, which this model could express because its positions are learned | Changing the repeat period across 32, 48 and 56 moves the score **8%**; a fixed offset would collapse at every period but one |
+| An artifact of my probe | The same probe on an untrained model returns ~1x across all 96 heads, asserted in `tests/` |
 
-**Technique 2: causal ablation.** Attention is correlational. A head can look at
-exactly the right place and contribute nothing to the output. So overwrite the
-head's slice of the attention output through a forward hook, before `out_proj` mixes
-the heads, and re-measure.
+### Removing them destroys 85.4% of the copying
+
+Attention is correlational: a head can look in exactly the right place and contribute
+nothing. So overwrite its slice of the attention output through a forward hook,
+before `out_proj` mixes the heads, and measure again.
 
 | Intervention | 2nd-copy loss | 1st-copy loss | 95% CI | Copying destroyed |
 |---|---|---|---|---|
 | **Mean ablation** | **+3.3473** | +0.28 | [+3.2306, +3.4697] | **85.4%** |
 | Zero ablation | +3.9089 | +0.28 | [+3.7656, +4.0438] | 99.7% |
 
-Ablating 2 of 96 heads destroys **85.4% of the model's repeated-sequence copying**.
-The null is size-matched, random head *pairs* rather than single heads, drawn from
-heads with no induction role: **+0.0624 ± 0.1074**, worst control **+0.2431**. The
-low end of the treatment's confidence interval clears the worst control by more than
-13x, which is **30.6 standard deviations** above the null mean. First-copy loss moves
-only +0.28, so this is targeted loss of one capability rather than general damage
-from perturbing the network.
+The null is size-matched: random head *pairs*, not single heads, drawn from heads
+with no induction role. It comes out at **+0.0624 ± 0.1074**, worst control
+**+0.2431**. The bottom of the treatment's confidence interval beats the worst
+control by more than 13x, which is **30.6 standard deviations** above the null mean.
+First-copy loss moves only +0.28, so this removes one capability rather than damaging
+the network in general.
 
-Two corrections that move the headline number, both applied:
+Two corrections, both applied, both of which lower the headline number:
 
-- **Mean over zero ablation.** Zeroing removes the head's mean contribution as well
-  as its input-dependent signal, pushing the residual stream off-distribution and
-  overstating the effect (Zhang and Nanda, 2024). The claim survives the stricter
-  test; the figure moves from 99.7% to 85.4%.
-- **A corrected denominator.** Later positions have more context whether or not
-  anything repeats. Measured on non-repeated sequences that positional component is
-  worth **+0.51 nats**, so the true copying benefit is 3.92 rather than the naive
-  4.43.
+- **Mean ablation, not zero.** Zeroing also removes the head's average contribution,
+  which pushes the residual stream somewhere the rest of the network never sees and
+  overstates the damage (Zhang and Nanda, 2024). The claim survives the stricter
+  test. The figure drops from 99.7% to 85.4%.
+- **A corrected denominator.** Later positions have more context whether anything
+  repeats or not. On non-repeated sequences that is worth **+0.51 nats**, so the real
+  copying benefit is 3.92, not 4.43.
 
-**Technique 3: composition analysis.** An induction head cannot work alone, and the
-reason is the interesting part. To predict what follows the second `B`, a head must
-attend to the position after the *first* `B`. But that position holds `C`, and
-nothing about `C` says "I follow a B", so the search fails. Something has to tag each
-position with its predecessor first. That is a **previous-token head**, and with
-standard attention it has to run in an earlier layer, because the tag must be written
-before it can be matched.
+### It is a circuit, not two correlated heads
 
-So the mechanism predicts a previous-token head below layer 6. `L5.H11` is one, at
-6.2x uniform, in layer 5, directly beneath the induction heads in layers 6 and 7.
+An induction head cannot work alone. To predict what follows the second `B`, it has
+to attend to the position after the *first* `B`. But that position holds `C`, and
+nothing about `C` says "I come after a B", so the search fails. Something has to tag
+each position with the token before it first. That is a **previous-token head**, and
+it has to run in an earlier layer, because the tag must be written before it can be
+matched.
+
+So the mechanism predicts one below layer 6. `L5.H11` is it: 6.2x baseline, layer 5,
+directly beneath the induction heads in layers 6 and 7.
 
 The test that earns the word "circuit" is not the loss, it is the attention pattern.
-If L5.H11 merely correlates with the induction heads, ablating it leaves their
-attention unmoved. Ablate it, then re-measure where they look:
+If the two heads only correlate, ablating L5.H11 leaves the induction pattern alone.
 
 | Head | Induction score, intact | With L5.H11 ablated | Fall |
 |---|---|---|---|
@@ -282,19 +280,19 @@ attention unmoved. Ablate it, then re-measure where they look:
 | L7.H8 | 0.2738 | 0.1671 | **39.0%** |
 
 The upstream head is writing the tag the downstream heads match on. That is
-**K-composition**: a mechanism with parts and an order they must run in.
+**K-composition**: a mechanism with parts and an order they have to run in.
 
-The pattern does not fall all the way to the 0.0142 baseline, and that is consistent
-with the rest of the picture. The previous-token role is **redundant**: L2.H2, L2.H10
-and L3.H0 all show partial previous-token behaviour, so removing L5.H11 leaves weaker
-copies of the same signal behind. The induction role is not redundant. Only two heads
-of 96 carry it, which is why removing both removes the capability.
+The pattern does not fall all the way to baseline, and that fits the rest of the
+picture. The previous-token job is **redundant**: L2.H2, L2.H10 and L3.H0 all do part
+of it, so removing L5.H11 leaves weaker copies behind. The induction job is not. Two
+heads out of 96 carry it, which is why removing both removes the capability.
 
-**Scope.** The 85.4% is copying on repeated random tokens, a narrower quantity than
-in-context learning on natural text (Crosbie and Shutova, 2024). It comes from one
-final checkpoint, so it establishes that the circuit exists and says nothing about
-when it formed. Full method, every control, the size-matched null, confidence
-intervals, limitations and 13 references:
+**Scope.** 85.4% is copying on repeated random tokens, which is narrower and easier
+than in-context learning on real text (Crosbie and Shutova, 2024). It comes from one
+final checkpoint, so it shows the circuit exists and says nothing about when it
+formed.
+
+Full method, all controls and 13 references:
 **[interp/INDUCTION_HEADS.md](interp/INDUCTION_HEADS.md)**.
 
 ```bash
@@ -306,56 +304,36 @@ python interp/circuit_controls.py      --ckpt weights8b_300epoch.pth
 
 ## 6. What is next
 
-The induction circuit is a mechanism I can see from the outside. The question I
-want to work on is whether a model can report on its own internals, and whether
-those reports are faithful. Chain-of-thought and self-report are the cheapest
-monitoring interface we have, and they are known to be unfaithful: models deny
-using a hint that ablation shows they used (Turpin et al., 2023).
+Both sections above read something out of the weights. The direction I want is
+harder: can a model **report** on its own internals, and is the report true?
+Self-report is the cheapest monitoring interface there is, and it is known to be
+unfaithful. Models deny using a hint that ablation proves they used (Turpin et al.,
+2023).
 
-The hard part of that problem is not the verbalization. It is the **ground
-truth**: you need to know what was actually in the activations before you can
-score a report about them, and that ground truth comes from probe readouts,
-feature activations, and the measured effect of ablation and patching. That is
-the side I have been building. `ablate_heads.py` already reads and overwrites
-internal activations through forward hooks, with a size-matched null and
-bootstrap confidence intervals, on a model whose entire training history I can
-account for.
+The bottleneck is not the verbalization. It is the **ground truth**: you cannot
+score a report about an activation until you know what was in it. That ground truth
+comes from probe readouts, feature activations, and measured ablation and patching
+effects. It is the half I have been building. `ablate_heads.py` already reads and
+overwrites activations through forward hooks, with a size-matched null and bootstrap
+CIs, on a model I can account for down to the optimizer step.
 
-The ladder from here, each rung a technique I want to be able to run cold:
+| Next | Why it, and why now |
+|---|---|
+| **Linear probes** on the residual stream | Start where the answer is known: `L5.H11` writes a previous-token tag, so a probe must recover the previous token at layer 5 and fail at layer 0. Same discipline as the planted-cliff test in `tests/`. |
+| **Activation patching** | Ablation shows a head is necessary. Patching shows which downstream components its output reaches. |
+| **Sparse autoencoders** on residual and MLP activations | Turns "which head" into "which feature". At 134M this trains on the same free GPU. |
+| **Self-report faithfulness** | With probes and features in place, the internals label themselves. In-context first, no training: how much can a model already say about a feature a probe says is active? Then fine-tune on those labels and test generalization to unseen inputs and unseen features. |
 
-- **Linear probes on the residual stream.** Start with a target this model
-  demonstrably computes: `L5.H11` writes a previous-token tag, so a probe should
-  recover the previous token from the layer-5 residual stream and fail at layer 0.
-  A circuit I have already localized causally gives the probe a known answer to
-  be checked against, which is the same discipline as the planted-cliff test in
-  `tests/`.
-- **Activation patching**, to move from necessity to path. Ablation shows a head
-  matters; patching shows which downstream components its output actually reaches.
-- **Sparse autoencoders** on the residual stream and MLP activations. At 134M with
-  8 layers this is trainable on the same free GPU, and having an SAE turns
-  "which head" into "which feature", which is the resolution introspection work
-  needs.
-- **Faithfulness of self-report.** With probes and SAE features in place, the
-  internals supply labels for free. First in-context, with no training: given a
-  feature that a probe says is active, how much can a model already say about it?
-  Then as fine-tuning, using probe readouts and ablation effects as the
-  supervision signal, and testing whether it generalizes to unseen inputs and
-  unseen features rather than memorizing the probe.
+This model cannot answer questions about itself. It is a base model, so the
+verbalization half needs a chat model. Its job is the measurement half: small enough
+to probe end to end on a CPU, fully specified, and mine.
 
-This model cannot answer questions about itself. It is a base model with no
-instruction tuning, so the verbalization half needs a chat model. What it is good
-for is the measurement half: a transformer small enough to probe end to end on a
-CPU, fully specified down to the optimizer step, and mine, so there is no gap
-between what I can measure and what I know about how it was made.
-
-Two experiments on this checkpoint that I still want to run:
-
-- **Formation dynamics.** Induction heads appear abruptly during training. Seeing
-  when this one formed needs mid-run checkpoints, which `train.py` now saves.
-- **The data-distribution experiment.** Chan et al. (2022) showed in-context
-  learning fails to emerge when burstiness and Zipfian marginals are stripped from
-  the training data. The tokenizer, the streaming pipeline and the training loop
-  are all in this repository, so that ablation is a 33-hour run away.
+Two experiments left on this checkpoint. **Formation dynamics**: induction heads
+appear abruptly during training, and seeing when this one formed needs the mid-run
+checkpoints `train.py` now saves. **The data-distribution experiment**: Chan et al.
+(2022) showed in-context learning fails to emerge when burstiness and Zipfian
+marginals are stripped from the data, and the tokenizer, pipeline and training loop
+here make that ablation a 33-hour run.
 
 ## 7. Run it
 
@@ -365,8 +343,16 @@ pip install -r requirements.txt
 python -m pytest tests/ -v                       # 23 tests, no checkpoint needed
 python verify.py --ckpt weights8b_300epoch.pth   # perplexity vs GPT-2-small
 ```
-Weights are on the Hugging Face Hub: **[HUGGING FACE URL]** (538 MB, past GitHub's
-file limit). Every analysis command above runs on CPU in under two minutes.
+
+Weights: **[huggingface.co/umerateeq/zerotogpt-134m](https://huggingface.co/umerateeq/zerotogpt-134m)**
+(538 MB, past GitHub's file limit), SHA-256 `958084909bbdcd20afb4f764b7628da6e8aef3d5212bd74b4097a158ae91bf49`.
+Every analysis command in this README runs on CPU in under two minutes.
+
+```bash
+pip install huggingface_hub
+python -c "from huggingface_hub import hf_hub_download; \
+print(hf_hub_download('umerateeq/zerotogpt-134m', 'weights8b_300epoch.pth'))"
+```
 
 ```
 pretrain/
@@ -383,23 +369,22 @@ interp/
   ablate_heads.py          zero and mean ablation, size-matched null, bootstrap CIs
   previous_token_heads.py  the upstream half of the circuit
   circuit_controls.py      K-composition, repeat period, positional baseline
+  CHECKPOINT_AUDIT.md      the run: the weight-decay clock, its controls, its limits
   INDUCTION_HEADS.md       the circuit: method, controls, limitations, 13 references
-  CHECKPOINT_AUDIT.md      the run: the weight-decay clock, its controls and its limits
-
-verify.py  one command to check the perplexity claims
+tests/                     23 tests, 14 on the analysis code
+verify.py                  one command to check the perplexity claims
 ```
 
-### Scope
-
-- **Not an assistant.** No instruction tuning, no RLHF. It completes text.
-- **Not competitive.** GPT-2-small beats it 3.1x on WikiText-2, which is what ~9
-  tokens per parameter buys.
-- **Not a trajectory.** The circuit results come from one final checkpoint.
+**Scope.** Not an assistant: no instruction tuning, no RLHF, it completes text. Not
+competitive: GPT-2-small beats it 3.1x on WikiText-2, which is what ~9 tokens per
+parameter buys. Not a trajectory: the circuit results come from one final checkpoint.
 
 ## Credits
 
-Model implementation follows Sebastian Raschka,
-[Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch).
-Memory-mapped sampler and parts of the training loop follow Andrej Karpathy,
-[nanoGPT](https://github.com/karpathy/nanoGPT). Data:
-[FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu).
+Implementation follows Sebastian Raschka,
+[Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch),
+and Andrej Karpathy, [nanoGPT](https://github.com/karpathy/nanoGPT), for the
+memory-mapped sampler and parts of the training loop. Data:
+[FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu). Method:
+[Elhage et al., A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html);
+[Olsson et al., In-context Learning and Induction Heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html).
