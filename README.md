@@ -70,7 +70,7 @@ different Common Crawl snapshot.
 | Weight decay | 0.1 | Grad clip | global norm 1.0 |
 | Precision | fp16 + `GradScaler` | Batch | 32 x 128 = 4,096 tok/step |
 | Optimizer steps | **~234,000** | Tokens | **~1.2B** |
-| Throughput | **10,200 tok/s** | Peak GPU memory | **6.12 GB** of 16 |
+| Throughput | **10,200 tok/s** | Peak GPU memory | **12.24 GB** of 16 |
 
 Three techniques exist because of the 16 GB ceiling:
 
