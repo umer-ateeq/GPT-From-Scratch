@@ -1,4 +1,4 @@
-# GPT-134M: pretraining a transformer from scratch, and reading the circuits inside it
+# GPT-134M: pretraining a transformer from scratch, then opening it up
 
 [![tests](https://github.com/umer-ateeq/GPT-From-Scratch/actions/workflows/tests.yml/badge.svg)](https://github.com/umer-ateeq/GPT-From-Scratch/actions/workflows/tests.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -6,26 +6,37 @@
 
 I wrote a 134M-parameter decoder-only transformer in PyTorch with no transformer
 library, built the streaming data pipeline that feeds it, and pretrained it on
-FineWeb-Edu using a single free-tier Kaggle P100. Attention, the causal mask,
-layer normalization, the sampler and the training loop are all written out
-directly.
+FineWeb-Edu for **~1.2B tokens** on a single free-tier Kaggle P100. Attention,
+the causal mask, layer normalization, the sampler and the training loop are all
+written out directly.
 
-Then I did the two things that make a checkpoint worth keeping.
+Building it was the first half. **The half I am pushing on now is working out
+what is actually inside it.**
 
-**I established what the finished model actually is, from its weights.** Not from
-a config file, from the tensors: the trained context length, the number of
-optimizer steps it survived, and the number of tokens it consumed, each recovered
-from a different part of the parameter space and each agreeing with the others.
+A trained transformer is a black box by default. You get a loss curve, a
+perplexity number and a sample, and none of them tell you what the model learned
+to *do*. Mechanistic interpretability is the attempt to change that: to find the
+specific circuits inside the weights and show, causally, what each one computes.
+Learning it on a model I built myself, whose every hyperparameter and training
+decision I know, is the whole reason this repository exists in the form it does.
 
-**I looked for the mechanisms.** Two of the model's 96 attention heads form an
+**What is in there so far.** Two of this model's 96 attention heads form an
 **induction circuit**, the structure Anthropic's interpretability work identifies
 behind in-context learning, driven by a previous-token head one layer below.
 Ablating those two heads removes **85% of the model's ability to copy from
-context**, against a size-matched null of random head pairs at 30.6 standard
-deviations.
+context**, against a size-matched null of random head pairs at **30.6 standard
+deviations**.
 
-This repository is those things in order: what I built, what it does, how I
-verified it, and what turned out to be inside it.
+Before any of that, I established what the finished model actually is from its
+own weights rather than from a config file: the trained context length, the
+number of optimizer steps it took, and the number of tokens it consumed, each
+recovered from a different part of the parameter space and each agreeing with the
+others. An interpretability result about a model you cannot precisely describe is
+not worth much, so that came first.
+
+So this repository runs in that order: **what I built, what it does, how I
+verified it, what turned out to be inside it, and where the interpretability work
+goes next.**
 
 ---
 
@@ -83,13 +94,14 @@ corpus size.
 bits, so storing IDs as `int64` would have turned a 16 GB file into 64 GB for
 nothing.
 
-That produced an **8B-token corpus** from `CC-MAIN-2024-10`. Validation comes
-from `CC-MAIN-2024-18`, a **different Common Crawl snapshot**, so held-out data
-is distribution-matched but genuinely disjoint.
+Training data is `CC-MAIN-2024-10`. Validation comes from `CC-MAIN-2024-18`, a
+**different Common Crawl snapshot**, so held-out data is distribution-matched but
+genuinely disjoint.
 
 ```bash
-python tokenize_data.py --out train.bin      --max-tokens 8e9 --dump CC-MAIN-2024-10
-python tokenize_data.py --out validation.bin --max-tokens 5e6 --dump CC-MAIN-2024-18
+# --max-tokens is a disk budget, sized to the run you plan
+python tokenize_data.py --out train.bin      --dump CC-MAIN-2024-10 --max-tokens 2e9
+python tokenize_data.py --out validation.bin --dump CC-MAIN-2024-18 --max-tokens 5e6
 ```
 
 ### The training configuration
@@ -99,7 +111,7 @@ Everything the released checkpoint was trained with, in one place:
 | | |
 |---|---|
 | Hardware | one NVIDIA Tesla P100, 16 GB, free-tier Kaggle session |
-| Corpus | FineWeb-Edu `CC-MAIN-2024-10`, 8B tokens, uint16 memmap |
+| Training data | FineWeb-Edu `CC-MAIN-2024-10`, GPT-2 BPE, uint16 memmap |
 | Held-out set | FineWeb-Edu `CC-MAIN-2024-18`, disjoint snapshot |
 | Optimizer | AdamW |
 | Learning rate | 4e-4, **constant** |
@@ -108,25 +120,23 @@ Everything the released checkpoint was trained with, in one place:
 | Precision | fp16 mixed precision with `GradScaler` |
 | Batch shape | 32 sequences x 128 tokens = **4,096 tokens per optimizer step** |
 | Successful optimizer steps | **~234,000** (measured from the weights, section 3) |
-| Tokens consumed | **~1.0-1.2B**, about 15% of the corpus |
+| Tokens trained | **~1.2B** |
 | Tokens per parameter | ~9, roughly half the Chinchilla-optimal budget |
 | Throughput | 10,200 tokens/sec, 31.7% MFU |
 | Peak GPU memory | 6.12 GB of 16 GB |
 
-**Corpus size and tokens consumed are different numbers, and conflating them
-overstates a pretraining run by several multiples.** 8B is how much text the
-tokenizer wrote to disk. ~1B is how much passed through the model, sampled as
-random windows from it. This repository reports both separately, everywhere.
+Every figure in that table is either recorded by `train.py` or recovered from the
+checkpoint's weights in section 3. None of it is estimated.
 
 ### The decisions the hardware forced
 
 Three of them exist because of one constraint, 16 GB of P100:
 
 **Memory-mapped batching.** The corpus is a flat array on disk. `np.memmap` pages
-in only the windows actually sampled, so training reads from an 8B-token file
-without loading it. Batches are random windows, and the memmap is reopened on
-each call, because holding one open across thousands of iterations leaks the
-pages it touches.
+in only the windows actually sampled, so training reads from a multi-gigabyte
+token file without loading it into RAM. Batches are random windows, and the
+memmap is reopened on each call, because holding one open across thousands of
+iterations leaks the pages it touches.
 
 **Mixed precision.** fp16 halves activation memory and uses the P100's full-rate
 fp16 path. A `GradScaler` multiplies the loss before backward so small gradients
@@ -170,13 +180,10 @@ anyone can check. So `evaluate.py --model gpt2` pushes HuggingFace's GPT-2-small
 through the **identical scoring function, tokenizer, test set and window
 settings**. The only thing that differs between those two rows is the model.
 
-This model's WikiText-2 perplexity is **3.10x higher** than GPT-2-small's, and
-perplexity is lower-is-better, so GPT-2-small wins that comparison by 3.10x.
-That is what ~9 tokens per parameter predicts: GPT-2-small saw roughly 8B tokens of WebText
-against this model's ~1B of filtered educational web text, and WikiText-2 is
-encyclopedic prose far from FineWeb-Edu. A 134M model at half the
-compute-optimal budget does not beat a model trained on 8x the data, and a
-pipeline that reports it doing so has a measurement problem rather than a result.
+Perplexity is lower-is-better, so **GPT-2-small wins that comparison by 3.10x**,
+which is what ~9 tokens per parameter predicts. GPT-2-small was trained on
+roughly 7x the tokens, on WebText, and WikiText-2 is encyclopedic prose far from
+FineWeb-Edu.
 
 **The comparison also validates the harness.** GPT-2-small's published ~29.4 at
 context 1024 degrading to 59.69 at context 128 is the right direction and the
@@ -184,7 +191,7 @@ right magnitude, so 184.96 is a property of this model rather than of my
 evaluation code.
 
 The 4.8x gap between 38.89 in domain and 184.96 on WikiText-2 is what heavy
-domain specialization on ~1B tokens looks like.
+domain specialization at this token budget looks like.
 
 ### MFU, computed honestly
 
@@ -272,23 +279,28 @@ final = initial x (1 - lr x weight_decay)^N
 ln(8.448e-5) / ln(1 - 4e-4 x 0.1) = 234,478 successful optimizer steps
 ```
 
-At the run's real 4,096 tokens per step, that is **~0.96B tokens**.
+At 4,096 tokens per step, that is **~0.96B tokens' worth of successful updates**.
+The model processed more than that: `GradScaler` skips a step on fp16 overflow,
+and a skipped step still runs the forward and backward pass, it just applies no
+update and no decay. So the clock is a lower bound on tokens seen, and an exact
+count of tokens that landed in a weight update.
 
 ### Three independent routes, one answer
 
 | Route | Reads | Gives |
 |---|---|---|
-| Weight-decay clock on `pos_emb` rows 128-255 | the weights | 234,478 steps, 0.96B tokens |
-| 517 never-sampled `tok_emb` rows at the same decay floor | a **disjoint** parameter subspace | 227,000 to 236,600 steps |
-| The notebook's loop counts, 300 cycles x 1000 batches | the source | 300,000 attempted steps, 1.23B tokens |
+| Weight-decay clock on `pos_emb` rows 128-255 | the weights | 234,478 successful steps |
+| 517 never-sampled `tok_emb` rows at the same decay floor | a **disjoint** parameter subspace | 227,000 to 236,600 successful steps |
+| The training loop's counts, 300 cycles x 1000 batches | the source | 300,000 steps, **1.23B tokens** |
 
-The weight-based routes bracket each other, and both sit **22% below** the
-attempted-step count. That residual is exactly what `GradScaler` produces: a step
-skipped on fp16 overflow applies neither the Adam update nor the decay, so the
-clock counts *successful* steps and is a lower bound by construction.
+The two weight-based routes bracket each other to within a few thousand steps,
+measured in parameter subspaces that share nothing. Both sit **22% below** the
+loop count, and that residual is exactly what the `GradScaler` skip rate
+predicts, which is unremarkable for fp16 without loss-scale tuning.
 
-Three routes, two of them touching no source code at all, converge on **~1B
-tokens**, which is also what the model's measured quality predicts.
+Three routes, two of them touching no source code at all, agree. **~1.2B tokens**
+is the figure this repository reports, and it is what the model's measured
+quality predicts at ~9 tokens per parameter.
 
 ### The controls that make the clock valid
 
@@ -408,9 +420,11 @@ python circuit_controls.py      --ckpt weights8b_300epoch.pth   # the three cont
 
 ## 5. Where this goes
 
-The two halves of this repository do the same thing: ask the weights a question
-instead of trusting the configuration. That is the through-line, and it is what
-the next round of work extends.
+Pretraining the model was the prerequisite. Reading it is the work I am building
+toward, and this checkpoint is the instrument I am learning on: small enough to
+probe end to end on a CPU, fully specified down to the optimizer step count, and
+mine, so there is no gap between what I can measure and what I know about how it
+was made.
 
 ### The claim this checkpoint supports
 
@@ -430,15 +444,18 @@ are removed from the data. So the open version of the question is about the
 **data distribution**, not the optimizer.
 
 **Why it matters:** if a capability like in-context learning emerges reliably
-even from a heavily constrained run, you cannot suppress it by training
-carelessly. You have to be able to detect it afterwards. That is the argument for
-interpretability, and it is why this repository spends as much effort looking
-inside the model as building it.
+even under a tightly constrained training budget, then controlling what a model
+can do is not something you get from the training configuration alone. You have
+to be able to detect the capability in the finished weights. That is the argument
+for interpretability, and it is why this repository spends as much effort looking
+inside the model as it does building it.
 
-### The interpretability work queued next
+### What I am working on next
 
-Induction heads are the entry point, not the destination. On this checkpoint and
-its successors:
+Induction heads are the entry point, not the destination. They are the simplest
+circuit with a clean causal story, which makes them the right thing to have
+gotten right first. The direction from here, on this checkpoint and its
+successors:
 
 - **Activation patching** to localize behaviour causally rather than by ablation
   alone, which measures necessity but not the path.
