@@ -108,7 +108,7 @@ metrics, throughput, peak memory and loss curve to `runs/`.
 | GPT-2-small | 124.44M | **59.69** |
 
 `pretrain/evaluate.py --model gpt2` runs GPT-2-small through the same scoring
-function, tokenizer, test set and window. Only the model differs. Both are scored on
+functionn, tokenizer, test set and window. Only the model differs. Both are scored on
 the full WikiText-2 raw test set, 285,396 tokens, context 128, non-overlapping
 windows, so no token is counted twice.
 
