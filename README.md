@@ -102,10 +102,10 @@ metrics, throughput, peak memory and loss curve to `runs/`.
 
 ### GPT-2-small on the identical harness
 
-| Model | Params | NLL | Perplexity |
+| Model | Params | Perplexity |
 |---|---|---|---|
-| This model | 134.08M | 5.2201 | **184.96** |
-| GPT-2-small | 124.44M | 4.0891 | **59.69** |
+| This model | 134.08M | **184.96** |
+| GPT-2-small | 124.44M | **59.69** |
 
 `pretrain/evaluate.py --model gpt2` runs GPT-2-small through the same scoring
 function, tokenizer, test set and window. Only the model differs. Both are scored on
