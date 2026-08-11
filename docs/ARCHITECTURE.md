@@ -93,11 +93,8 @@ absolute position, which is simple and is what GPT-2 did. Its weakness is that
 it cannot extrapolate past the trained positions, which is precisely what made
 the context bug in [AUDIT.md](AUDIT.md) both possible and detectable.
 
-## Deliberately not used
+## Scope
 
-RoPE, RMSNorm, SwiGLU, grouped-query attention and Flash Attention are all
-absent. This is the GPT-2-era baseline the released checkpoint was trained with,
-and swapping components in would mean the published weights no longer match the
-published code. They are the obvious next step, not a current feature, and
-[RESULTS.md](RESULTS.md) lists them under "not measured" rather than implying
-otherwise.
+This is a GPT-2-era architecture, implemented directly and trained end to end.
+Every component above is the one the released checkpoint was trained with, so the
+published weights and the published code always match.

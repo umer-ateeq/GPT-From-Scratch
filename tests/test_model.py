@@ -79,7 +79,7 @@ def test_every_parameter_receives_gradient():
     model = GPTModel(CONFIG_TINY)
     x = torch.randint(0, CONFIG_TINY["vocab_size"], (2, 16))
     y = torch.randint(0, CONFIG_TINY["vocab_size"], (2, 16))
-    calc_loss_batch(x, y, model, CONFIG_TINY["vocab_size"]).backward()
+    calc_loss_batch(x, y, model, torch.device("cpu")).backward()
     dead = [n for n, p in model.named_parameters()
             if p.requires_grad and p.grad is None]
     assert not dead, f"no gradient reached: {dead}"
@@ -98,7 +98,7 @@ def test_untrained_loss_is_close_to_random_guessing():
     x = torch.randint(0, CONFIG_TINY["vocab_size"], (4, 16))
     y = torch.randint(0, CONFIG_TINY["vocab_size"], (4, 16))
     with torch.no_grad():
-        loss = calc_loss_batch(x, y, model, CONFIG_TINY["vocab_size"]).item()
+        loss = calc_loss_batch(x, y, model, torch.device("cpu")).item()
     assert abs(loss - math.log(CONFIG_TINY["vocab_size"])) < 0.5
 
 
@@ -164,8 +164,8 @@ def test_training_run_leaves_a_complete_record(tmp_path):
         [sys.executable, "train.py",
          "--train-bin", str(train_bin), "--val-bin", str(val_bin),
          "--n-layers", "2", "--n-heads", "4", "--emb-dim", "64", "--context", "32",
-         "--batch-size", "4", "--grad-accum", "2", "--train-tokens", "2048",
-         "--warmup-steps", "2", "--eval-every", "2", "--eval-iters", "2",
+         "--batch-size", "4", "--grad-accum", "2", "--train-tokens", "4096",
+         "--warmup-steps", "2", "--eval-freq", "2", "--eval-iter", "2",
          "--dtype", "float32", "--out-dir", str(out_dir), "--run-name", "citest"],
         cwd=repo, capture_output=True, text=True, timeout=900)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -181,8 +181,9 @@ def test_training_run_leaves_a_complete_record(tmp_path):
         assert config[key]
 
     summary = json.loads((run / "summary.json").read_text())
-    # tokens_seen must come from the tensors, not from the config
-    assert summary["tokens_seen"] == summary["optimizer_steps"] * 4 * 32 * 2
+    # tokens_seen must come from the tensors, not from the config:
+    # optimizer_steps x grad_accum micro-batches x batch_size x context
+    assert summary["tokens_seen"] == summary["optimizer_steps"] * 2 * 4 * 32
     assert math.isfinite(summary["final_val_loss"])
     assert summary["final_val_perplexity"] == pytest.approx(
         math.exp(summary["final_val_loss"]), rel=1e-3)

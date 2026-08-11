@@ -1,0 +1,14 @@
+{
+  "final_val_loss": 10.991,
+  "final_val_perplexity": 59337.74,
+  "best_val_loss": 10.9675,
+  "tokens_seen": 59904,
+  "optimizer_steps": 29,
+  "steady_tokens_per_sec": 914,
+  "steady_achieved_tflops": 0.07,
+  "steady_mfu_percent": null,
+  "avg_tokens_per_sec": 700,
+  "peak_gpu_mem_gb": 0.0,
+  "n_params": 13270016,
+  "total_wall_time_s": 89.6
+}

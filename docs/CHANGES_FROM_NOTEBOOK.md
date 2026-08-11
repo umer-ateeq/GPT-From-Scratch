@@ -4,12 +4,17 @@ The model was trained by the Colab notebook preserved unedited at
 [../notebooks/original_colab_training.ipynb](../notebooks/original_colab_training.ipynb).
 This package is that notebook reorganized into importable modules.
 
-**The maths is unchanged.** Attention, the feed-forward block, layer
-normalization, the loss, the sampler and the training loop are the same
-implementations, moved rather than rewritten. `tests/test_model.py` asserts the
-architecture still produces exactly 134,077,440 parameters and still loads the
-original checkpoint with `strict=True`, which would fail if any layer had been
-altered.
+**The model code is verbatim.** All five classes in `model.py`
+(`MultiHeadAttention`, `FeedForward`, `LayerNorm`, `TransformerBlock`,
+`GPTModel`) are character-for-character identical to the notebook cells,
+including their comments and spacing. So are `generate`, `text_to_token_ids` and
+`token_ids_to_text` in `generate.py`. `tests/test_model.py` additionally asserts
+the architecture still produces exactly 134,077,440 parameters and still loads
+the original checkpoint with `strict=True`, which would fail if any layer had
+been altered.
+
+See [CODE_MAP.md](CODE_MAP.md) for a file-by-file split of what is verbatim, what
+was restructured, and what was added afterwards.
 
 Everything that did change is listed below. Nothing is omitted.
 
@@ -120,9 +125,8 @@ config.
   `F.scaled_dot_product_attention` would be faster, but the explicit version is
   the point of a from-scratch project and it is what the released checkpoint was
   trained with.
-- **ReLU rather than GELU, learned positional embeddings rather than RoPE,
-  LayerNorm rather than RMSNorm, untied output head.** These are the choices the
-  checkpoint was trained under. Changing them would mean the published weights no
-  longer match the published code.
+- **ReLU activations, learned positional embeddings, custom LayerNorm, untied
+  output head.** These are the choices the checkpoint was trained under. Changing
+  any of them would mean the published weights no longer match the published code.
 - **The notebook itself**, which is kept unedited because [AUDIT.md](AUDIT.md)
   cites specific cells in it as evidence.

@@ -1,20 +1,28 @@
 """Batch sampling from a memory-mapped token file.
 
 The corpus is a flat array of uint16 token IDs on disk, several gigabytes of it.
-`np.memmap` lets the operating system page in only the slices actually touched,
-so training reads from an 8B-token file while using almost no RAM.
+np.memmap lets the operating system page in only the slices actually touched, so
+training reads from an 8B-token file while using almost no RAM.
 
 A batch is `batch_size` random windows of `block_size` tokens. Targets are the
 same windows shifted one position right, which is the whole of the next-token
 prediction objective: predict token i+1 from tokens 0..i.
 
-Change from the original notebook, made deliberately (see docs/AUDIT.md):
-`get_batch` takes `batch_size` and `block_size` as explicit arguments. In the
-notebook they were module-level globals read at call time, and a later cell
-reassigned both. The sampler silently switched from the configured 64 x 256 to
-32 x 128 while every printed summary still reported 64 x 256. Passing them as
-arguments makes that class of bug impossible, and
-tests/test_model.py asserts the returned shape follows the arguments.
+This is the notebook's get_batch with two deliberate changes, both explained in
+docs/CHANGES_FROM_NOTEBOOK.md:
+
+  1. batch_size, block_size and the file path are ARGUMENTS rather than module
+     globals. In the notebook they were globals read at call time, and a later
+     cell reassigned them, so the sampler silently switched from the configured
+     64 x 256 to 32 x 128. That is bug 1 in docs/AUDIT.md, and passing them in
+     makes it impossible. tests/test_model.py asserts the shape follows the
+     arguments.
+  2. torch.randint's upper bound is len(data) - block_size - 1 rather than
+     len(data) - block_size, because the TARGET window reaches one token further
+     than the input window and could otherwise run off the end of the file.
+
+Everything else, including the memory-leak note and the pinned-memory trick, is
+unchanged.
 """
 import numpy as np
 import torch
@@ -31,34 +39,17 @@ def count_tokens(path):
 
 
 def get_batch(path, batch_size, block_size, device):
-    """Sample one batch of random windows from the token file at `path`.
-
-    Returns (x, y), both int64 tensors of shape (batch_size, block_size), where
-    y is x shifted forward by one token.
-
-    The memmap is recreated on every call on purpose. Holding one open across
-    thousands of iterations leaks memory, because the pages it touches are never
-    released. This follows nanoGPT's approach.
-    """
-    data = np.memmap(path, dtype=np.uint16, mode="r")
-
-    # Random start offsets. The -1 leaves room for the target window, which
-    # extends one token further than the input window.
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    data = np.memmap(path, dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-
-    x = torch.stack([
-        torch.from_numpy(data[i:i + block_size].astype(np.int64)) for i in ix])
-    y = torch.stack([
-        torch.from_numpy(data[i + 1:i + 1 + block_size].astype(np.int64)) for i in ix])
-
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device.type == "cuda":
-        # Pinned memory can be copied to the GPU asynchronously, so the transfer
-        # overlaps with computation instead of blocking on it.
-        x = x.pin_memory().to(device, non_blocking=True)
-        y = y.pin_memory().to(device, non_blocking=True)
+        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
-
     return x, y
 
 

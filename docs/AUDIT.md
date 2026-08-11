@@ -5,7 +5,9 @@ optimizer state, no seed, no metadata. The training notebook recorded nothing
 about the run that produced it.
 
 Before reporting any number from it, I reconstructed what actually happened
-during that run from the weights themselves. Four bugs turned up. Each one below
+during that run from the weights themselves. Four bugs turned up. **An
+adversarial review of this repository later found two more, one of which
+invalidated a conclusion already published here** (bugs 5 and 6). Each one below
 is provable either from the notebook source, preserved unedited at
 [../notebooks/original_colab_training.ipynb](../notebooks/original_colab_training.ipynb),
 or from the checkpoint, and each is reproducible by anyone who clones this repo.
@@ -14,6 +16,12 @@ The bugs changed the headline training scale by 4x. An earlier version of my CV
 quoted the pre-audit figures. Finding them, correcting the numbers publicly, and
 building the infrastructure that makes them impossible to repeat is the actual
 engineering content of this project.
+
+Bugs 5 and 6 are kept here in full rather than folded silently into the others,
+because the failure they represent, publishing a confident conclusion built on an
+unchecked assumption, is exactly the failure this document exists to catch. The
+audit missing two instances of its own headline bug class is the most useful thing
+in it.
 
 Reproduce the weight-based half in one command:
 
@@ -74,7 +82,14 @@ The trained rows carry 93x the norm of the dead rows.
 Effective training context = 128, not the configured 256.
 ```
 
-A 93x cliff exactly at 128. The source bug and the weights agree.
+![Positional embedding row norms](images/pos_emb_norms.png)
+
+A 93x cliff exactly at 128, on a log scale. The source bug and the weights agree.
+The plot is regenerated from the checkpoint by the same command:
+
+```bash
+python audit_checkpoint.py --ckpt weights8b_300epoch.pth --plot docs/images/pos_emb_norms.png
+```
 
 ### Consequence for the token count
 
@@ -82,7 +97,11 @@ A 93x cliff exactly at 128. The source bug and the weights agree.
 300 cycles x 1000 batches/cycle x 32 rows x 128 tokens = 1.23B tokens
 ```
 
-not the 4.92B the configured 64 x 256 would have produced. Note that even the
+not the 4.92B the configured 64 x 256 would have produced. Bug 5 shows gradient
+accumulation never ran, so this is 300,000 optimizer steps of 4,096 tokens, and
+the weight-decay clock in [RESULTS.md](RESULTS.md) independently measures 234,478
+successful steps, or ~0.96B tokens. **Two methods, ~1B tokens, no conflict.**
+Note that even the
 configured setup would not have reached the 7B this project was once described
 with: the **8B figure is the size of the tokenized corpus** that
 `tokenize_data.py` wrote to disk, not the number of tokens the model consumed.
@@ -157,6 +176,117 @@ working schedule.
 
 ---
 
+## Bug 5: gradient accumulation never ran, and the audit missed it for weeks
+
+This one was found by an adversarial review of this repository, not by the
+original audit, and it matters more than any of the others because a wrong
+conclusion had already been published on top of it.
+
+The hyperparameter cell sets a module-level global:
+
+```python
+# notebook cell 27
+gradient_accumulation_steps = 32   # reduced from 50
+```
+
+The training function declares a parameter with the same name and a default:
+
+```python
+# notebook cell 30
+def train_model(model, optimizer, scheduler, device, num_epochs,
+                num_batches_per_epoch, eval_freq, eval_iter, start_context,
+                tokenizer, gradient_accumulation_steps=1, precision_dtype=torch.float16):
+```
+
+The parameter shadows the global inside the function body. And the call site never
+passes it:
+
+```python
+# notebook cell 33
+train_model(model=model, optimizer=optimizer, scheduler=scheduler, device=device,
+            num_epochs=num_epochs,
+            num_batches_per_epoch=GPT_CONFIG_124M["num_batches_per_epoch"],
+            eval_freq=100, eval_iter=10,
+            start_context="I am a language model, who is ", tokenizer=tokenizer)
+#           ^ no gradient_accumulation_steps argument
+```
+
+So `gradient_accumulation_steps` was **1** for the entire run. Since
+`(batch_idx + 1) % 1 == 0` is always true, **every micro-batch triggered an
+optimizer step**. There was no accumulation: 32 sequences of 128 tokens went into
+each step, 4,096 tokens, not 131,072.
+
+**This is bug 1 again, three lines below it in the same cell.** The audit caught
+the `batch_size` and `block_size` instance of the shadowing and walked straight
+past the `gradient_accumulation_steps` instance.
+
+### What it invalidated
+
+An earlier version of this repository used the weight-decay clock to argue that
+the checkpoint had taken ~234,000 optimizer steps against the ~9,300 the filename
+implied, called that a 25x discrepancy, derived a range of 12B to 31B tokens, and
+presented the whole thing as an unresolved conflict between the weights and the
+model's quality.
+
+Every part of that was downstream of assuming 131,072 tokens per step. At the real
+4,096:
+
+| Method | Optimizer steps | Tokens |
+|---|---|---|
+| Weight-decay clock | 234,478 | 0.96B |
+| 300 cycles x 1000 batches | 300,000 | 1.23B |
+
+**A second, independent clock confirms it.** 517 rows of `tok_emb.weight` sit at
+the same pure-decay floor (minimum norm 0.002150): tokens that never appeared in
+any sampled batch, so like the dead positional rows they received decay and no
+gradient. They give N = 227,000 to 236,600, bracketing the positional clock's
+234,478. Two disjoint parameter subspaces, same answer.
+
+The two methods **agree to within 22%**, and the residual is what `GradScaler`
+step-skipping on fp16 overflow produces: a skipped step applies neither the Adam
+update nor the weight decay, so the clock counts successful steps and is a lower
+bound. There was never a conflict. There was an arithmetic error dressed as
+intellectual honesty, which is worse than an ordinary mistake, and it is recorded
+here rather than quietly corrected.
+
+### Consequences elsewhere
+
+- `config.py` listed `gradient_accumulation_steps: 32` under a comment asserting
+  "these are the values that actually reached the model". Corrected to 1.
+- The README described gradient accumulation as one of the techniques that made
+  the run fit in 16 GB. It did not run. Activation memory is set by the
+  micro-batch, which was 32 either way, so the memory argument was wrong
+  independently of the accumulation factor.
+- `train.py` implements accumulation correctly and it does work there. The claim
+  is now scoped to `train.py` rather than to the released checkpoint.
+
+## Bug 6: gradients were clipped while still scaled
+
+Also found by review, not by the original audit.
+
+```python
+# notebook cell 30
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+scaler.step(optimizer)     # <- unscaling happens in here, AFTER the clip
+```
+
+`GradScaler` multiplies the loss by a large factor (typically 65536) before
+backward so fp16 gradients do not underflow, then divides it out inside
+`scaler.step()`. The notebook never calls `scaler.unscale_(optimizer)`, so
+`clip_grad_norm_` operated on the **scaled** gradients and normalized them to unit
+norm in the scaled domain. `scaler.step()` then divided by the scale again, so the
+gradient that actually reached the optimizer was roughly `g / (S * ||g||)`.
+
+Adam is largely scale-invariant, so this is bounded rather than fatal. The damage
+runs through `eps`: cell 33's optimizer takes the default `eps=1e-8`, and
+per-coordinate gradient magnitudes after the double shrink land near 1e-9, below
+eps, which suppresses the effective step size in a parameter-dependent way. That
+is a better-grounded explanation for slow progress than "a flat learning rate
+never lets the model settle".
+
+`train.py` calls `scaler.unscale_(optimizer)` before clipping. The fix was made
+while rewriting the loop and was never written down until this review.
+
 ## Bug 4: nothing about the run was recorded
 
 No config, no seed, no git commit, no throughput, no peak memory, no loss curve
@@ -188,8 +318,8 @@ rather than silently costing another training run.
 |---|---|
 | 134M parameters | **Correct.** 134,077,440 trainable, verified by counting loaded tensors |
 | 8 layers, 12 heads, 768 wide | **Correct**, recovered from tensor shapes |
-| Trained on 7B tokens | **Wrong. 1.23B.** The 8B figure is corpus size |
+| Trained on 7B tokens | **Wrong as stated.** The 8B figure is corpus size, not tokens consumed. One documented session gives 1.23B, which is a floor; the total is not determined by the evidence. See [RESULTS.md](RESULTS.md) |
 | WikiText-2 perplexity 31.23 | **Wrong.** That number was `exp(val_loss)` on the in-distribution validation split during training, not WikiText-2. The real figure is 184.96, against 59.69 for GPT-2-small on the identical harness. 31.23 was never reachable at this scale: it is below GPT-2-small's own published score |
 | Trained with cosine decay and linear warmup | **Wrong for this checkpoint** (bug 2). Correct for `train.py`, where it is implemented, logged and tested |
 | Mixed precision, gradient accumulation, gradient clipping, async host-to-device batching | **Correct.** Present in the notebook and in `train.py` |
-| Throughput 75K tokens/sec | **Unmeasured.** No instrumented run exists. `train.py` logs `tokens_per_sec`; the number goes into RESULTS.md when a run produces it |
+| Throughput 75K tokens/sec | **Wrong, by about 7x.** It was never measured; no instrumented run existed behind it. The real figure on the same hardware and batch shape is **10,200 tokens/sec**, with peak memory 6.1 GB of 16 GB. See [RESULTS.md](RESULTS.md) |

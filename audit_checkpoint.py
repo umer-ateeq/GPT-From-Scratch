@@ -38,6 +38,9 @@ def parse_args():
     p.add_argument("--batches-per-cycle", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=32,
                    help="micro-batch rows actually used by the run")
+    p.add_argument("--plot", default=None, metavar="PATH",
+                   help="also save the positional-embedding norm plot here, "
+                        "e.g. --plot docs/pos_emb_norms.png")
     return p.parse_args()
 
 
@@ -93,6 +96,65 @@ def positional_embedding_audit(state, dead_ratio):
         "threshold": threshold,
         "n_dead": int((~alive).sum().item()),
     }
+
+
+def plot_position_norms(norms, trained_prefix, threshold, path):
+    """Draw the evidence for the context-length bug as a single figure.
+
+    The whole argument of the audit is visible here: a row of the positional
+    embedding table only receives gradient if some training batch was long enough
+    to reach it, and AdamW weight decay shrinks whatever it touches. So untrained
+    rows collapse toward zero and the boundary shows up as a cliff.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = norms.numel()
+    x = range(n)
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+
+    ax.plot(x, norms.tolist(), linewidth=1.6, color="#1f77b4")
+    ax.axhline(threshold, color="#999999", linestyle=":", linewidth=1,
+               label=f"dead threshold ({threshold:.4f})")
+
+    if 0 < trained_prefix < n:
+        ax.axvline(trained_prefix, color="#d62728", linestyle="--", linewidth=1.4)
+        ax.axvspan(0, trained_prefix, color="#1f77b4", alpha=0.07)
+        ax.axvspan(trained_prefix, n - 1, color="#d62728", alpha=0.07)
+
+        trained_mean = norms[:trained_prefix].mean().item()
+        dead_mean = norms[trained_prefix:].mean().item()
+        ratio = trained_mean / max(dead_mean, 1e-12)
+
+        ax.annotate(
+            f"trained: positions 0-{trained_prefix - 1}\nmean norm {trained_mean:.4f}",
+            xy=(trained_prefix * 0.45, trained_mean), xytext=(trained_prefix * 0.10, trained_mean * 3.0),
+            fontsize=9, color="#1f77b4",
+            arrowprops=dict(arrowstyle="->", color="#1f77b4", lw=1))
+        ax.annotate(
+            f"never received gradient: {trained_prefix}-{n - 1}\n"
+            f"mean norm {dead_mean:.6f}  ({ratio:,.0f}x smaller)",
+            xy=(trained_prefix + (n - trained_prefix) * 0.5, dead_mean),
+            xytext=(trained_prefix + (n - trained_prefix) * 0.08, dead_mean * 12),
+            fontsize=9, color="#d62728",
+            arrowprops=dict(arrowstyle="->", color="#d62728", lw=1))
+
+        title = (f"Configured context 256, actually trained at {trained_prefix}")
+    else:
+        title = f"All {n} positions trained"
+
+    ax.set_yscale("log")  # the two regimes are ~2 orders of magnitude apart
+    ax.set_xlabel("position index in pos_emb.weight")
+    ax.set_ylabel("L2 norm of the row (log scale)")
+    ax.set_title(title)
+    ax.set_xlim(0, n - 1)
+    ax.grid(alpha=0.25, which="both")
+    ax.legend(loc="center left", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"\n  wrote {path}")
 
 
 def main():
@@ -155,6 +217,9 @@ def main():
     naive = args.cycles * args.batches_per_cycle * 64 * 256
     print(f"  (the configured 64 x 256 would have given {naive / 1e9:.2f}B, "
           f"a {naive / tokens:.1f}x overcount)")
+
+    if args.plot:
+        plot_position_norms(norms, prefix, audit["threshold"], args.plot)
 
 
 if __name__ == "__main__":
