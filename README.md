@@ -120,22 +120,20 @@ model, not of my evaluation code.
 
 ## 4. Reading the training run out of the weights
 
-The checkpoint is a bare `state_dict`: 117 tensors, no config, no metadata. Every
-number in the training table above came back out of those tensors.
+The checkpoint is a bare `state_dict`: 117 tensors, no config. Every number in the
+training table came back out of those tensors.
 
 ```bash
 python interp/audit_checkpoint.py --ckpt weights8b_300epoch.pth
 ```
 
-The model has 256 positional rows. The run used 128. So half of `pos_emb.weight` got
-weight decay on every step and gradient on none. Those rows are a recording of the
-run, and two numbers come out of them.
+The model has 256 positional rows. The run used 128. The other 128 got weight decay
+every step and gradient never, which makes them a record of the run.
 
 ### The trained context is 128
 
-A positional row gets a gradient only if a batch reaches that position. AdamW decays
-it either way. So rows the run never reached shrink toward zero, and rows it reached
-hold their norm.
+Decay shrinks a row toward zero. Gradient holds it up. So rows the run never reached
+collapse:
 
 ```
    positions  0-31   32-63   64-95  96-127 | 128-159 160-191 192-223 224-255
@@ -144,15 +142,14 @@ hold their norm.
 
 ![Positional embedding row norms, a 93x cliff exactly at position 128](images/pos_emb_norms.png)
 
-A **93x cliff, exactly at position 128**. This sets the evaluation context. The same
-data scored at 256 gives 74.70 instead of 38.89, and all of that gap is measurement
-error, so `evaluate.py` reads the cliff off the weights and warns before printing.
+A **93x cliff at position 128**. This fixes the evaluation context: the same data
+scored at 256 reads 74.70 instead of 38.89, all of it measurement error.
 
 ### The run took 234,478 optimizer steps
 
-Those 128 rows were multiplied by the same decay factor on every step that landed.
-Multiply it out and the shrinkage counts the steps. `nn.Embedding` starts from
-N(0,1), so a fresh row of width 768 has norm `sqrt(768) = 27.71`:
+Every landed step multiplied those dead rows by the same factor. Undo it and you get
+the step count. `nn.Embedding` starts at N(0,1), so a fresh row of width 768 has norm
+`sqrt(768) = 27.71`:
 
 ```
 final = initial x (1 - lr x weight_decay)^N
@@ -161,25 +158,23 @@ final = initial x (1 - lr x weight_decay)^N
 ln(8.448e-5) / ln(1 - 4e-4 x 0.1) = 234,478 steps
 ```
 
-Three routes agree, and two never read the source code:
+Three routes agree. Two never read the source:
 
 | Route | Reads | Result |
 |---|---|---|
 | Decay clock on `pos_emb` rows 128-255 | the weights | 234,478 steps |
-| 517 never-sampled `tok_emb` rows at the same floor | a **different** part of the weights | 227,000 to 236,600 steps |
-| Training loop counts, 300 cycles x 1000 batches | the source | 300,000 steps, 1.23B tokens |
+| 517 never-sampled `tok_emb` rows | a different part of the weights | 227,000 to 236,600 steps |
+| Loop counts, 300 cycles x 1000 batches | the source | 300,000 steps, 1.23B tokens |
 
-The two weight-based routes share no parameters and agree to within a few thousand
-steps out of 234,000. Both come in 22% under the loop count, which is the
-`GradScaler` skip rate: a step skipped on fp16 overflow still runs forward and
-backward, but applies no update and no decay. The clock counts steps that changed
-the weights.
+The two weight routes share no parameters and agree to a few thousand steps. Both
+land 22% under the loop count, which is the `GradScaler` skip rate: a skipped step
+runs forward and backward but applies no update and no decay.
 
 ### The controls
 
-This only works if those rows are untouched initialization that was scaled down, not
-rows that trained and then decayed. Training pulls neighbouring rows into alignment
-and spreads their norms. Scaling does neither.
+This works only if those rows are initialization that was scaled down, not rows that
+trained and then decayed. Training aligns neighbouring rows and spreads their norms.
+Scaling does neither.
 
 | | Norm spread (std/mean) | Adjacent-row cosine |
 |---|---|---|
@@ -187,31 +182,23 @@ and spreads their norms. Scaling does neither.
 | **Checkpoint rows 128-255** | **2.72%** | **0.028** |
 | Checkpoint rows 0-127 (trained) | 23.10% | 0.822 |
 
-Both numbers match fresh initialization and are nowhere near the trained rows. 2.75%
-is also what theory gives: for a random vector of width 768 the norm varies by
-`1/sqrt(2 x 768) = 2.6%`. `tests/` plants a fake cliff in a fresh model and checks
-that the audit finds it, so the detector has been tested against a known answer.
+They match fresh initialization and are nowhere near the trained rows. 2.75% is also
+what theory gives: a random vector of width 768 varies by `1/sqrt(2 x 768) = 2.6%`.
+`tests/` plants a fake cliff and checks the audit finds it.
 
 Full method and limits: **[interp/CHECKPOINT_AUDIT.md](interp/CHECKPOINT_AUDIT.md)**.
 
 ## 5. Reading the circuit out of the weights
 
-Same method, harder question. Section 4 asked what the weights say about the *run*.
-This asks what they say about the *computation*.
-
 An induction head follows one rule: *"I have seen this token before. What came next
 last time? Attend to that."* It is the leading account of in-context learning
-(Olsson et al., 2022). The question: does a 134M model trained on a free GPU at
-context 128 build one at all.
+(Olsson et al., 2022). Does a 134M model trained on a free GPU build one?
 
 ### Two heads out of 96 do induction
 
 Feed the model a random sequence repeated twice and measure where every head looks.
-**Random tokens are the point.** The model cannot fall back on memorized English, so
-any copying has to come from the context. A causal head at position `i` splits its
-attention over `i + 1` positions, so a head with no preference puts `1/(i+1)` on any
-one of them. Averaged over the measured queries that is **0.0142**, the baseline
-below. 16 sequences.
+**Random tokens are the point**: the model cannot use memorized English, so any
+copying comes from the context. A head with no preference scores **0.0142**.
 
 ![Induction score by head](images/induction_heads.png)
 
@@ -223,76 +210,63 @@ below. 16 sequences.
 | everything else | ~0.014 | ~1x |
 
 `L6.H9` puts **42% of its attention on one position** out of fifty plus. Three things
-it could have been instead, and is not:
+it is not:
 
 | Alternative | Ruled out by |
 |---|---|
-| A duplicate-token head, which spots repeats without predicting | 0.4188 on the **next** token against 0.0136 on the **same** token, a factor of **31** |
-| A fixed positional offset, which this model could express because its positions are learned | Changing the repeat period across 32, 48 and 56 moves the score **8%**; a fixed offset would collapse at every period but one |
-| An artifact of my probe | The same probe on an untrained model returns ~1x across all 96 heads, asserted in `tests/` |
+| A duplicate-token head | 0.4188 on the **next** token, 0.0136 on the **same** token: **31x** |
+| A fixed positional offset | Changing the repeat period across 32, 48, 56 moves the score **8%** |
+| An artifact of my probe | An untrained model scores ~1x on all 96 heads, asserted in `tests/` |
 
 ### Removing them destroys 85.4% of the copying
 
-Attention is correlational: a head can look in exactly the right place and contribute
-nothing. So overwrite its slice of the attention output through a forward hook,
-before `out_proj` mixes the heads, and measure again.
+A head can look in the right place and do nothing. So overwrite its slice of the
+attention output with a forward hook and measure again.
 
 | Intervention | 2nd-copy loss | 1st-copy loss | 95% CI | Copying destroyed |
 |---|---|---|---|---|
 | **Mean ablation** | **+3.3473** | +0.28 | [+3.2306, +3.4697] | **85.4%** |
 | Zero ablation | +3.9089 | +0.28 | [+3.7656, +4.0438] | 99.7% |
 
-The null is size-matched: random head *pairs*, not single heads, drawn from heads
-with no induction role. It comes out at **+0.0624 ± 0.1074**, worst control
-**+0.2431**. The bottom of the treatment's confidence interval beats the worst
-control by more than 13x, which is **30.6 standard deviations** above the null mean.
-First-copy loss moves only +0.28, so this removes one capability rather than damaging
-the network in general.
+The null is size-matched: random head *pairs*, drawn from heads with no induction
+role. It comes out at **+0.0624 ± 0.1074**, worst control **+0.2431**. The bottom of
+the treatment's CI beats that worst control by 13x, or **30.6 standard deviations**
+over the null mean. First-copy loss moves +0.28, so this removes one capability, not
+general function.
 
-Two corrections, both applied, both of which lower the headline number:
-
-- **Mean ablation, not zero.** Zeroing also removes the head's average contribution,
-  which pushes the residual stream somewhere the rest of the network never sees and
-  overstates the damage (Zhang and Nanda, 2024). The claim survives the stricter
-  test. The figure drops from 99.7% to 85.4%.
-- **A corrected denominator.** Later positions have more context whether anything
-  repeats or not. On non-repeated sequences that is worth **+0.51 nats**, so the real
-  copying benefit is 3.92, not 4.43.
+Both corrections lower the number and both are applied. Zero ablation also strips the
+head's average output, which pushes the residual stream off-distribution and
+overstates damage (Zhang and Nanda, 2024), so mean ablation is the headline: 99.7%
+becomes 85.4%. And later positions have more context whether anything repeats or not,
+worth **+0.51 nats**, so the real copying benefit is 3.92, not 4.43.
 
 ### It is a circuit, not two correlated heads
 
-An induction head cannot work alone. To predict what follows the second `B`, it has
-to attend to the position after the *first* `B`. But that position holds `C`, and
-nothing about `C` says "I come after a B", so the search fails. Something has to tag
-each position with the token before it first. That is a **previous-token head**, and
-it has to run in an earlier layer, because the tag must be written before it can be
-matched.
+An induction head cannot work alone. To predict what follows the second `B` it must
+attend to the position after the *first* `B`. That position holds `C`, and nothing
+about `C` says "I come after a B". Something has to tag each position with the token
+before it, in an earlier layer, because the tag must exist before it can be matched.
+That is a **previous-token head**.
 
-So the mechanism predicts one below layer 6. `L5.H11` is it: 6.2x baseline, layer 5,
-directly beneath the induction heads in layers 6 and 7.
-
-The test that earns the word "circuit" is not the loss, it is the attention pattern.
-If the two heads only correlate, ablating L5.H11 leaves the induction pattern alone.
+`L5.H11` is one: 6.2x baseline, layer 5, right below the induction heads in 6 and 7.
+Ablate it and re-measure the induction *pattern*. If the heads only correlated, it
+would not move.
 
 | Head | Induction score, intact | With L5.H11 ablated | Fall |
 |---|---|---|---|
 | L6.H9 | 0.4188 | 0.2504 | **40.2%** |
 | L7.H8 | 0.2738 | 0.1671 | **39.0%** |
 
-The upstream head is writing the tag the downstream heads match on. That is
-**K-composition**: a mechanism with parts and an order they have to run in.
+The upstream head writes the tag the downstream heads match on. That is
+**K-composition**. It does not fall to baseline because L2.H2, L2.H10 and L3.H0 each
+do part of the previous-token job. Nothing backs up the induction job, which is why
+removing two heads out of 96 removes the capability.
 
-The pattern does not fall all the way to baseline, and that fits the rest of the
-picture. The previous-token job is **redundant**: L2.H2, L2.H10 and L3.H0 all do part
-of it, so removing L5.H11 leaves weaker copies behind. The induction job is not. Two
-heads out of 96 carry it, which is why removing both removes the capability.
+**Scope.** 85.4% is copying on repeated random tokens, easier than in-context
+learning on real text (Crosbie and Shutova, 2024). One checkpoint, so it shows the
+circuit exists, not when it formed.
 
-**Scope.** 85.4% is copying on repeated random tokens, which is narrower and easier
-than in-context learning on real text (Crosbie and Shutova, 2024). It comes from one
-final checkpoint, so it shows the circuit exists and says nothing about when it
-formed.
-
-Full method, all controls and 13 references:
+Full method, all controls, 13 references:
 **[interp/INDUCTION_HEADS.md](interp/INDUCTION_HEADS.md)**.
 
 ```bash
