@@ -40,7 +40,7 @@ def parse_args():
                    help="micro-batch rows actually used by the run")
     p.add_argument("--plot", default=None, metavar="PATH",
                    help="also save the positional-embedding norm plot here, "
-                        "e.g. --plot docs/pos_emb_norms.png")
+                        "e.g. --plot images/pos_emb_norms.png")
     return p.parse_args()
 
 

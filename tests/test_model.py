@@ -40,6 +40,32 @@ def test_parameter_count_is_exactly_134M():
     assert trainable + buffers == 134_601_728
 
 
+def test_published_parameter_breakdown_sums_to_the_total():
+    """The per-component table in the README must reconcile.
+
+    A breakdown that does not add up to its own total is the cheapest possible
+    thing for a reader to check and the most expensive one to get wrong, so the
+    published figures are pinned here rather than maintained by hand.
+    """
+    model = GPTModel(GPT_CONFIG_134M)
+    published = {
+        "tok_emb": 38_597_376,
+        "pos_emb": 196_608,
+        "trf_blocks": 56_684_544,
+        "final_norm": 1_536,
+        "out_head": 38_597_376,
+    }
+    actual = {
+        "tok_emb": model.tok_emb.weight.numel(),
+        "pos_emb": model.pos_emb.weight.numel(),
+        "trf_blocks": sum(p.numel() for p in model.trf_blocks.parameters()),
+        "final_norm": sum(p.numel() for p in model.final_norm.parameters()),
+        "out_head": model.out_head.weight.numel(),
+    }
+    assert actual == published
+    assert sum(published.values()) == 134_077_440
+
+
 def test_untied_output_head_is_a_separate_matrix():
     """Tying the head to the embedding would silently drop 38.6M parameters."""
     model = GPTModel(GPT_CONFIG_134M)
@@ -102,11 +128,11 @@ def test_untrained_loss_is_close_to_random_guessing():
 
 
 def test_batch_shape_follows_arguments_not_globals(tmp_path):
-    """AUDIT.md bug 1.
+    """The batch shape must follow the arguments, always.
 
-    The notebook's sampler read module-level globals that a later cell
-    reassigned, so it produced 32x128 batches while the config still said
-    64x256. The shape must follow the arguments, always.
+    A sampler that reads its shape from module globals can silently run at a
+    different shape than the configuration says, with nothing raised. Passing the
+    shape in makes that unrepresentable; this pins it.
     """
     path = tmp_path / "toy.bin"
     np.arange(5000, dtype=np.uint16).tofile(path)
@@ -123,10 +149,11 @@ def test_batch_shape_follows_arguments_not_globals(tmp_path):
 
 
 def test_lr_warms_up_then_decays_and_never_climbs():
-    """AUDIT.md bug 3.
+    """The whole schedule shape, not just its endpoints.
 
-    The notebook set a cosine floor of 5e-4 against a peak of 1e-4, so its
-    "decay" would have been a climb. Assert the whole schedule shape.
+    A cosine floor typed independently of the peak can end up above it, which
+    turns the decay into a climb and raises nothing. Deriving the floor from the
+    peak makes that impossible; this asserts the resulting shape.
     """
     peak, floor, warmup, total = 6e-4, 6e-5, 100, 1000
 
@@ -144,11 +171,12 @@ def test_lr_warms_up_then_decays_and_never_climbs():
 
 
 def test_training_run_leaves_a_complete_record(tmp_path):
-    """AUDIT.md bug 4.
+    """Every run must leave a record behind.
 
-    The original run recorded nothing, which is why three other bugs went
-    unnoticed. Every run must leave config, metrics and summary behind, and the
-    logged token count must equal what actually passed through the model.
+    A run that records nothing cannot be audited afterwards, and a logged token
+    count that drifts from what actually passed through the model makes every
+    per-token figure unverifiable. Assert config, metrics and summary exist, and
+    that the logged token count matches the real one.
     """
     import json
 

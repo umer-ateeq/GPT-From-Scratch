@@ -40,7 +40,7 @@ number: 10x uniform is a strong, clear induction head; 1x is nothing.
 
 Usage:
     python induction_heads.py --ckpt weights8b_300epoch.pth
-    python induction_heads.py --ckpt weights8b_300epoch.pth --plot docs/images/induction_heads.png
+    python induction_heads.py --ckpt weights8b_300epoch.pth --plot images/induction_heads.png
 """
 import argparse
 

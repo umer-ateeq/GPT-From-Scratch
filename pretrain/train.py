@@ -8,35 +8,34 @@ The techniques here exist because of one constraint, a single 16 GB P100:
                            then unscales before the optimizer step.
   Gradient accumulation    micro-batches accumulate before one optimizer step,
                            giving the gradient quality of a large batch at the
-                           memory cost of a small one. Available here via
-                           --grad-accum. NOTE: it did NOT run for the released
-                           checkpoint (docs/AUDIT.md bug 5).
+                           memory cost of a small one, via --grad-accum. The
+                           released checkpoint ran at --grad-accum 1, so every
+                           micro-batch was an optimizer step.
   Gradient clipping        caps the global gradient norm at 1.0, so one bad batch
                            cannot destabilize training. scaler.unscale_() is
-                           called FIRST so the clip sees real gradients; the
-                           notebook clipped scaled ones (docs/AUDIT.md bug 6).
+                           called FIRST, so the clip sees real gradients rather
+                           than scaled ones.
   Pinned async transfers   see data.py: host-to-device copies overlap with compute.
 
-`train_model` below keeps the structure of the original notebook's training
-function: the same nested epoch / batch loop, the same accumulate-then-step
-pattern, the same evaluation checkpoints, the same per-epoch sample generation.
-Four things inside it are fixed, each documented in docs/AUDIT.md:
+Four invariants this loop is built to hold:
 
-  1. The batch shape is passed to get_batch instead of read from module globals,
-     which is what silently changed the run from 64 x 256 to 32 x 128.
-  2. There is no scheduler object. The notebook built one around an optimizer
-     that the training cell then replaced, so every scheduler.step() updated an
-     object that no longer touched the model. Here `lr_schedule(step)` returns a
-     float that is written into the live optimizer, so nothing can desynchronize.
-  3. The cosine floor is derived as lr/10 rather than typed separately. The
-     notebook set min_lr=5e-4 against a peak of 1e-4, so its "decay" was a climb.
-  4. Every run writes its config, metrics, summary and loss curve to runs/.
-     The original run recorded nothing, which is why the three bugs above went
-     unnoticed for months.
+  1. The batch shape is passed to get_batch, never read from module globals, so
+     the shape that runs is always the shape that was configured.
+  2. There is no scheduler object. `lr_schedule(step)` returns a float that is
+     written into the live optimizer, so the schedule cannot desynchronize from
+     the optimizer actually stepping the model.
+  3. The cosine floor is derived as lr/10 rather than typed separately, so it
+     cannot be set above the peak and turn the decay into a climb.
+  4. Every run writes its config, metrics, summary and loss curve to runs/, so
+     any number it produced can be audited afterwards.
 
 Usage:
     python train.py --train-bin train.bin --val-bin validation.bin \
         --train-tokens 100e6 --lr 4e-4 --run-name baseline
+
+    # keep intermediate checkpoints, for studying how a circuit forms
+    python train.py --train-bin train.bin --val-bin validation.bin \
+        --train-tokens 1e9 --save-every 5000 --run-name formation
 """
 import argparse
 import json
@@ -94,6 +93,13 @@ def parse_args():
                    help="batches averaged per loss estimate")
     p.add_argument("--start-context", default="I am a language model, who is ",
                    help="prompt sampled at the end of each epoch")
+    p.add_argument("--save-every", type=int, default=0,
+                   help="keep a weights-only checkpoint every N optimizer steps, "
+                        "in runs/<name>/checkpoints/. 0 (default) keeps only the "
+                        "final one. Set this to study how a circuit forms: a "
+                        "final checkpoint shows that one exists, not when. Step 0 "
+                        "is included, which gives the untrained baseline the "
+                        "induction probe measures against for free")
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--dtype", choices=["float16", "bfloat16", "float32"],
                    default="float16",
@@ -269,6 +275,7 @@ class RunLogger:
     metrics.jsonl  one line per evaluation
     summary.json   final losses, tokens, throughput, MFU, peak memory
     loss_curve.png train and validation loss against tokens seen
+    checkpoints/   ckpt_step_*.pth, only when --save-every is set
     """
 
     def __init__(self, out_dir, run_name, config):
@@ -297,6 +304,22 @@ class RunLogger:
         self.history.append(metrics)
         with open(os.path.join(self.dir, "metrics.jsonl"), "a") as f:
             f.write(json.dumps(metrics) + "\n")
+
+    def save_step_checkpoint(self, model, step, tokens_seen):
+        """Keep the weights at one step, alongside the run they came from.
+
+        Weights only, not optimizer state: these exist to be analysed, not
+        resumed from, and the optimizer state would triple the size of every
+        file for nothing. The step and token count go in the filename and in
+        the payload, so a directory of these is self-describing.
+        """
+        raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+        ckpt_dir = os.path.join(self.dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        path = os.path.join(ckpt_dir, f"ckpt_step_{step:07d}.pth")
+        torch.save({"model": raw.state_dict(), "step": step,
+                    "tokens_seen": tokens_seen}, path)
+        print(f"[logger] checkpoint at step {step}: {path}")
 
     def finish(self, **summary):
         summary["total_wall_time_s"] = round(time.time() - self.t0, 1)
@@ -334,7 +357,7 @@ class RunLogger:
 def train_model(
     model,
     optimizer,
-    lr_schedule,          # was `scheduler`: now a function, see bug 2 above
+    lr_schedule,          # a function of the step, not a scheduler object
     device,
     num_epochs,
     num_batches_per_epoch,
@@ -342,8 +365,8 @@ def train_model(
     eval_iter,
     start_context,
     tokenizer,
-    train_bin,            # added: the sampler takes its data and shape as
-    val_bin,              # arguments now, rather than reading globals (bug 1)
+    train_bin,            # the sampler takes its data and its shape as
+    val_bin,              # arguments, never from module globals
     batch_size,
     block_size,
     grad_clip,
@@ -351,6 +374,7 @@ def train_model(
     n_params,
     gradient_accumulation_steps=1,
     precision_dtype=torch.float16,
+    save_every=0,         # 0 disables; otherwise keep a checkpoint every N steps
 ):
     # Track metrics
     train_losses, val_losses, track_tokens_seen = [], [], []
@@ -402,6 +426,13 @@ def train_model(
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
+
+                # Intermediate checkpoint. Off by default. Induction heads and
+                # other circuits appear abruptly during training, and a final
+                # checkpoint cannot say when: answering that needs the weights
+                # at intervals, kept rather than overwritten.
+                if save_every and global_step % save_every == 0:
+                    logger.save_step_checkpoint(model, global_step, tokens_seen)
 
                 # Evaluation checkpoint
                 if global_step % eval_freq == 0:
@@ -548,9 +579,15 @@ def main():
                       f"({type(e).__name__}: {e}). Training continues uncompiled.")
 
     if args.sdpa:
-        from fast_attention import enable_sdpa
-        backend = enable_sdpa(model, device)
-        print(f"fused attention enabled, backend: {backend}")
+        try:
+            from fast_attention import enable_sdpa
+        except ImportError:
+            print("--sdpa ignored: pretrain/fast_attention.py is not present in "
+                  "this checkout. Training continues with the explicit attention "
+                  "in model.py, which is what the released checkpoint used.")
+        else:
+            backend = enable_sdpa(model, device)
+            print(f"fused attention enabled, backend: {backend}")
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -580,6 +617,7 @@ def main():
         n_params=n_params,
         gradient_accumulation_steps=args.grad_accum,
         precision_dtype=precision_dtype,
+        save_every=args.save_every,
     )
 
     torch.save({"model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),

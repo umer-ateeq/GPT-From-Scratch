@@ -8,21 +8,15 @@ A batch is `batch_size` random windows of `block_size` tokens. Targets are the
 same windows shifted one position right, which is the whole of the next-token
 prediction objective: predict token i+1 from tokens 0..i.
 
-This is the notebook's get_batch with two deliberate changes, both explained in
-docs/CHANGES_FROM_NOTEBOOK.md:
+Two details in the sampler are load-bearing:
 
-  1. batch_size, block_size and the file path are ARGUMENTS rather than module
-     globals. In the notebook they were globals read at call time, and a later
-     cell reassigned them, so the sampler silently switched from the configured
-     64 x 256 to 32 x 128. That is bug 1 in docs/AUDIT.md, and passing them in
-     makes it impossible. tests/test_model.py asserts the shape follows the
-     arguments.
+  1. batch_size, block_size and the file path are ARGUMENTS, never module
+     globals. A sampler that reads its shape from globals at call time can
+     silently disagree with the configuration it was supposed to run at, and
+     nothing raises. tests/test_model.py asserts the shape follows the arguments.
   2. torch.randint's upper bound is len(data) - block_size - 1 rather than
      len(data) - block_size, because the TARGET window reaches one token further
      than the input window and could otherwise run off the end of the file.
-
-Everything else, including the memory-leak note and the pinned-memory trick, is
-unchanged.
 """
 import numpy as np
 import torch

@@ -72,9 +72,9 @@ def main():
           f"degrade the induction PATTERN?")
     print("=" * 72)
 
-    intact, _ = induction_scores(model, L, 16, vocab, args.seed)
+    intact, _ = induction_scores(model, L, args.n_seqs, vocab, args.seed)
     handles = [m.register_forward_pre_hook(fn) for m, fn in hooks_for(model, [prev])]
-    ablated, _ = induction_scores(model, L, 16, vocab, args.seed)
+    ablated, _ = induction_scores(model, L, args.n_seqs, vocab, args.seed)
     for h in handles:
         h.remove()
 
@@ -88,11 +88,14 @@ def main():
         worst = max(worst, fall)
         print(f"  {f'L{layer}.H{head}':>8}  {a:8.4f}  {b:13.4f}  {fall:6.1f}%")
 
-    print(f"\n  VERDICT: {'K-composition SUPPORTED' if worst > 30 else 'NOT SUPPORTED'}"
+    print(f"\n  VERDICT: {'CAUSAL DEPENDENCE' if worst > 30 else 'NOT SUPPORTED'}"
           f" (largest fall {worst:.1f}%)")
     if worst > 30:
-        print("  The upstream head is feeding the induction heads' key-side match,")
-        print("  which is what makes this a circuit rather than two correlated heads.")
+        print("  The induction heads' attention pattern depends causally on the")
+        print("  upstream head, which is what makes this a circuit rather than two")
+        print("  correlated heads. Note this does NOT isolate K-composition: the")
+        print("  ablation removes the head from the query, key and value paths and")
+        print("  the intervening MLPs at once. Separating them needs path patching.")
 
     # ---------------------------------------------------------------- control 2
     print()
@@ -104,7 +107,10 @@ def main():
     print(f"  {'period L':>10}  {'score':>8}  {'x uniform':>10}")
     scores = []
     for period in (L * 2 // 3, L, L + L // 6):
-        s, _ = induction_scores(model, period, 8, vocab, args.seed + 1)
+        # Same sample size and seed as every other measurement, so the L row
+        # here is directly comparable to the headline induction score rather
+        # than being a second estimate of the same quantity.
+        s, _ = induction_scores(model, period, args.n_seqs, vocab, args.seed)
         val = s[induction[0][0], induction[0][1]].item()
         scores.append(val)
         print(f"  {period:>10}  {val:8.4f}  {val / uniform_baseline(period):9.1f}x")

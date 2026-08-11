@@ -1,13 +1,15 @@
 """The 134M-parameter GPT: attention, feed-forward, layer norm, blocks.
 
-Written from scratch in PyTorch. Nothing here comes from a transformer library:
-the attention scores, the causal mask, the softmax and the normalization are all
-written out explicitly.
+Written out in PyTorch. Nothing here comes from a transformer library: the
+attention scores, the causal mask, the softmax and the normalization are all
+explicit. The architecture follows Sebastian Raschka, "Build a Large Language
+Model (From Scratch)".
 
-The classes below are unchanged from the original training notebook
-(notebooks/original_colab_training.ipynb), because they are what the released
-checkpoint was trained with. tests/test_model.py asserts they still produce
-exactly 134,077,440 parameters and still load that checkpoint with strict=True.
+The classes below are kept byte-identical to the code the released checkpoint
+was trained with, which is why nothing in interp/ modifies them: the analysis
+hooks the modules from outside instead. tests/test_model.py asserts they still
+produce exactly 134,077,440 parameters and still load that checkpoint with
+strict=True.
 """
 import torch
 import torch.nn as nn

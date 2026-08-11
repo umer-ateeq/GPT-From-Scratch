@@ -12,7 +12,7 @@ Two decoding strategies, both written out rather than imported:
               occasionally producing nonsense.
 
 Context handling: the released checkpoint allocates 256 positional embeddings
-but only positions 0-127 were ever trained (see docs/AUDIT.md). Conditioning on
+but only positions 0-127 were ever trained (see interp/CHECKPOINT_AUDIT.md). Conditioning on
 more than 128 tokens therefore indexes embedding rows that never received a
 gradient, and quality degrades sharply. `--context 128` is the default for that
 reason, and the sampler crops its conditioning window rather than letting it grow.

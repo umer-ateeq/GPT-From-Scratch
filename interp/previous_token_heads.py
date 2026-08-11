@@ -31,7 +31,7 @@ than anything about specific words.
 
 Usage:
     python previous_token_heads.py --ckpt weights8b_300epoch.pth
-    python previous_token_heads.py --ckpt weights8b_300epoch.pth --plot docs/images/prev_token_heads.png
+    python previous_token_heads.py --ckpt weights8b_300epoch.pth --plot images/prev_token_heads.png
 """
 import argparse
 
