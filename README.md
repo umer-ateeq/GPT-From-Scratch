@@ -1,233 +1,294 @@
-﻿# GPT-134M: what the weights say the training run actually did
+# GPT-134M: a transformer built from scratch, and a look inside it
 
 [![tests](https://github.com/umer-ateeq/GPT-From-Scratch/actions/workflows/tests.yml/badge.svg)](https://github.com/umer-ateeq/GPT-From-Scratch/actions/workflows/tests.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](requirements.txt)
 
-I pretrained a 134M-parameter GPT from scratch in PyTorch on a single free
-Kaggle P100, with no transformer library: attention, the causal mask, layer
-normalization and the training loop all written out directly.
+I wrote a 134M-parameter decoder transformer in PyTorch with no transformer
+library, built the data pipeline for it, and pretrained it on FineWeb-Edu using a
+single free Kaggle P100. Attention, the causal mask, layer normalization and the
+training loop are all written out directly.
 
-Then I stopped trusting it, and took it apart. Two things came out of that.
+Then I wanted to know two things about the thing I had made.
 
-**The configuration was lying.** The config said context 256 and 4.9B tokens. The
-weights say context **128**. **Six** separate bugs, each proven from the
-checkpoint or the notebook source. Two of them were found by an adversarial
-review of this repository, after it was written, and one invalidated a conclusion
-I had already published here. Both are recorded in full rather than quietly
-corrected.
+**Did it train the way I thought it did?** It did not. Auditing the checkpoint
+against its own configuration turned up six bugs, one of which had been quietly
+halving the context length for the entire run.
 
-**The model built an induction circuit anyway.** Two of its 96 attention heads
-implement the in-context copying mechanism from Anthropic's induction-heads work,
-fed by a previous-token head one layer below. Ablating those two heads destroys
-**85.4% of the model's repeated-sequence copying**, while leaving everything else
-intact, and ablating the upstream head degrades the downstream heads' attention
-pattern by 40%, which is what makes it a circuit rather than two correlated
-heads.
+**Are the structures I had been reading about actually in there?** Yes. Two of
+its 96 attention heads form an induction circuit, the mechanism Anthropic's
+interpretability work identifies behind in-context learning, fed by a
+previous-token head one layer below. Ablating them removes 85% of the model's
+ability to copy from context.
 
-Those two findings sit oddly together, and that is the interesting part: a run
-this broken, at roughly half its compute-optimal token budget with half its
-context untrained and no working learning-rate schedule, still formed a clean,
-causally necessary induction circuit.
-
-**Almost every number here was produced by a script in this repo, with the
-command next to it.** The exceptions are named where they occur: the weight-decay
-clock is hand-computed from `audit_checkpoint.py` output, and the throughput
-figures come from a Kaggle session whose full logs were not retrieved. Where
-something cannot be pinned down, this repo says so rather than picking a
-flattering point.
+This repository is those three things in order: how it was built, whether it did
+what I thought, and what turned out to be inside it.
 
 ---
 
-## 1. The configuration was lying
+## 1. What I built
+
+| | |
+|---|---|
+| Type | decoder-only transformer, GPT-2 style |
+| Parameters | **134,077,440** trainable |
+| Layers / heads / width | 8 / 12 / 768, head dimension 64 |
+| Feed-forward | 4x expansion, ReLU |
+| Normalization | custom LayerNorm, learned scale and shift, **pre-norm** |
+| Positional encoding | learned absolute embeddings |
+| Vocabulary | 50257, GPT-2 BPE via `tiktoken` |
+| Output head | **untied** from the input embedding |
+| Context | 256 allocated, **128 actually trained** (see section 2) |
+
+Every row was recovered from the checkpoint's tensor shapes rather than copied
+from a config, and `tests/test_model.py` asserts the parameter count exactly.
+Component-by-component reasoning is in
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**; the code is
+**[model.py](model.py)**, about 130 lines.
+
+### The data pipeline
+
+FineWeb-Edu does not fit on a free notebook's disk, so it is **streamed** rather
+than downloaded, tokenized in chunks, and written straight into a pre-allocated
+memory-mapped `uint16` file. Peak RAM stays at roughly one chunk regardless of
+corpus size. `uint16` is deliberate: GPT-2's vocabulary tops out at 50256, which
+fits in 16 bits, so storing IDs as `int64` would have made a 16 GB file 64 GB for
+nothing.
+
+That produced an **8B-token** corpus from `CC-MAIN-2024-10`. Validation comes from
+`CC-MAIN-2024-18`, a **different Common Crawl snapshot**, so it is
+distribution-matched but genuinely disjoint.
+
+```bash
+python tokenize_data.py --out train.bin      --max-tokens 8e9 --dump CC-MAIN-2024-10
+python tokenize_data.py --out validation.bin --max-tokens 5e6 --dump CC-MAIN-2024-18
+```
+
+### The training decisions, and why
+
+Three of them exist because of one constraint, 16 GB of P100:
+
+**Memory-mapped batching.** The corpus is a flat array on disk. `np.memmap` pages
+in only the windows actually sampled, so training reads from an 8B-token file
+without loading it. Batches are random windows, and the memmap is reopened each
+call, because holding one across thousands of iterations leaks the pages it
+touches.
+
+**Mixed precision (fp16).** Halves activation memory and uses the P100's
+full-rate fp16 path. A `GradScaler` multiplies the loss before backward so small
+gradients do not underflow to zero, then unscales before the optimizer step. The
+unscaling has to happen *before* gradient clipping, or the clip normalizes
+scaled gradients, which is bug 6 below.
+
+**Pinned asynchronous transfers.** Host-to-device copies overlap with compute
+rather than blocking on it.
+
+**Gradient accumulation** is implemented in `train.py` and available via
+`--grad-accum`, but be aware it did **not** run for the released checkpoint. That
+is bug 5. Activation memory is set by the micro-batch either way, which is why the
+run still fit in 6.12 GB.
+
+```bash
+python train.py --train-bin train.bin --val-bin validation.bin \
+    --train-tokens 1e9 --lr 4e-4 --batch-size 32 --run-name baseline
+```
+
+Every run writes its full configuration, git commit, seed, per-eval metrics,
+throughput, MFU, peak memory and loss curve to `runs/`. Examples are committed
+there. That infrastructure exists because the original run recorded none of it,
+which is how the bugs in section 2 survived.
+
+## 2. What it actually does
+
+| Metric | Value |
+|---|---|
+| Tokens consumed | **~1.0-1.2B**, about 15% of the corpus, agreed by two independent methods |
+| Tokens per parameter | ~9, roughly half the Chinchilla-optimal budget |
+| Held-out perplexity | **38.89** at context 128, on the disjoint snapshot |
+| TinyStories perplexity | 35.41 |
+| WikiText-2 perplexity | **184.96**, against **59.69** for GPT-2-small |
+| Throughput | **10,200 tokens/sec**, **31.7% MFU** at batch 32 x 128, fp16 |
+| Peak GPU memory | **6.12 GB** of 16 GB |
+
+**This model loses to GPT-2-small by 3.1x on WikiText-2**, and that is the honest
+headline. A perplexity number without a reference measured the same way is not a
+claim anyone can check, so `evaluate.py --model gpt2` runs GPT-2-small through the
+identical scoring function, tokenizer, test set and window. The only thing that
+differs between those two rows is the model.
+
+The comparison also validates the harness: GPT-2-small's published ~29.4 at
+context 1024 degrading to 59.69 at context 128 is the right direction and
+magnitude, so 184.96 is a property of this model rather than of my evaluation
+code. Losing is the expected outcome at ~9 tokens per parameter.
+
+[SAMPLES.md](SAMPLES.md) has six unedited completions from one seeded run, with
+the prompts fixed in source so they could not be chosen after the fact. They are
+locally fluent and factually wrong, which is what 184.96 predicts.
+
+Full detail, both protocols, and what remains weakly evidenced:
+**[docs/RESULTS.md](docs/RESULTS.md)**.
+
+## 3. Did it train the way I thought?
+
+No. The configuration and the weights disagreed, and the weights were right.
 
 `pos_emb.weight` holds one row per position. A row only receives gradient if some
-training batch was long enough to reach it, and AdamW's weight decay shrinks
-whatever it touches. So an untrained position decays toward zero and leaves a
-permanent mark.
+batch was long enough to reach it, and AdamW's weight decay shrinks whatever it
+touches, so an untrained position decays toward zero and leaves a permanent mark.
 
 ![Positional embedding row norms, a 93x cliff exactly at position 128](docs/images/pos_emb_norms.png)
 
-A **93x cliff exactly at position 128**, on a log scale. The run had been training
-at context 128 while every summary reported 256, because a notebook cell
-eighteen cells after `get_batch` was defined rebound the globals it read.
+A **93x cliff exactly at position 128**. The run had been training at context 128
+while every summary said 256, because a cell eighteen cells after `get_batch` was
+defined rebound the globals it read.
 
-```bash
-python audit_checkpoint.py --ckpt weights8b_300epoch.pth
-```
+**Six bugs in total**, each proven from the checkpoint or the notebook source:
 
-Three more bugs turned up in the same pass, including a warmup-plus-cosine
-schedule bound to an optimizer the training cell had already replaced, so it never
-touched the weights at all. A later adversarial review of this repo found two
-more, one of which invalidated a published conclusion. All six, with the proof for
-each and the code change that now prevents it: **[docs/AUDIT.md](docs/AUDIT.md)**.
+| | Bug | Effect |
+|---|---|---|
+| 1 | Batch-shape globals rebound after `get_batch` closed over them | Context silently halved to 128 |
+| 2 | LR scheduler bound to an optimizer the training cell then replaced | No warmup, no decay, flat 4e-4 |
+| 3 | Cosine floor set 5x **above** the peak | Inert, only because of bug 2 |
+| 4 | No run recorded a config, seed, or metric | Bugs 1-3 invisible for months |
+| 5 | `gradient_accumulation_steps` never passed to `train_model` | Accumulation never ran |
+| 6 | `clip_grad_norm_` applied to **scaled** gradients | Effective step size suppressed |
 
-### Reading the token count off the weights, two ways
+**Bugs 5 and 6 were found by an adversarial review of this repository, after it
+was written, and bug 5 invalidated a conclusion I had already published here.**
+Both are recorded in full rather than quietly corrected, because a repo whose
+argument is "check your claims against the artifact" has to survive that being
+done to it.
 
-The untrained rows are also a clock. AdamW touches every parameter twice per
-step: a multiplicative weight decay, and a gradient update. Rows 128-255 received
-no gradient, so **only the decay ever applied to them**, and their total shrinkage
-integrates the learning rate across the checkpoint's whole life:
+### The weights can also count the optimizer steps
+
+The untrained rows are a clock. They received decay and no gradient, so their
+total shrinkage integrates the learning rate across the checkpoint's whole life:
 
 ```
 final = initial x (1 - lr x weight_decay)^N
-
-27.7765  ->  0.002346          shrinkage 8.448e-5, measured
-sum of learning rates = 93.8   (weight_decay = 0.1)
-at the flat 4e-4 that ran      ->  ~234,000 optimizer steps
+27.7765 -> 0.002346   shrinkage 8.448e-5,  sum of lr = 93.8,  N ~ 234,000 steps
 ```
 
-Now the second route. Bug 5 in the audit is that gradient accumulation never ran:
-`train_model` defaults `gradient_accumulation_steps=1` and the training cell never
-passes the argument, so the `32` set in the hyperparameter cell was inert. **Every
-micro-batch was an optimizer step.** 300 cycles x 1000 batches = **300,000**
-attempted steps.
+Independently, the notebook's loop counts give 300 cycles x 1000 batches =
+**300,000** attempted steps. The two agree to within 22%, and the gap is
+`GradScaler` skipping fp16 overflow steps, which apply no decay either. A third
+clock, 517 never-sampled `tok_emb` rows, gives 227,000-236,600.
 
-| Method | Optimizer steps | Tokens at 32 x 128 per step |
-|---|---|---|
-| Weight-decay clock, from the weights | 234,478 | 0.96B |
-| Loop counts, from the notebook | 300,000 | 1.23B |
+Three routes, **~1B tokens**, matching the model's quality. Full derivation and
+the controls that validate it: **[docs/AUDIT.md](docs/AUDIT.md)**.
 
-**The two agree to within 22%**, and the gap has an obvious cause: `GradScaler`
-skips `optimizer.step()` whenever fp16 gradients overflow, which is common early
-in training, and a skipped step applies no weight decay either. So the clock
-measures *successful* steps and is a lower bound on attempted ones.
+## 4. What is inside it
 
-Two independent methods, one reading the weights and one reading the source,
-converging on **roughly 1B tokens**. That also matches the model's quality: at
-about 9 tokens per parameter, under half the Chinchilla budget, losing 3.1x to
-GPT-2-small is the expected outcome rather than a puzzle.
-
-**An earlier version of this README got this wrong** and claimed the clock implied
-25x more training than the filename, presenting the two as an unresolved conflict.
-That came from multiplying by an accumulation factor of 32 that never executed. The
-error, and the correction, are in [docs/AUDIT.md](docs/AUDIT.md) as bug 5. Full
-working in [docs/RESULTS.md](docs/RESULTS.md).
-
-## 2. The model built an induction circuit anyway
+Having built the model and established what it really is, the question I actually
+wanted to answer: **are the structures described in the interpretability
+literature present in a model I trained myself, on a free GPU, badly?**
 
 An induction head implements one rule: *"I have seen this token before. What came
-next last time? Attend to that."* It is believed to be the main mechanism behind
-in-context learning.
-
-Feed the model a random token sequence repeated twice and measure where each of
-the 96 heads looks. Random tokens matter: the model cannot fall back on memorized
-English, so any copying has to come from the context.
+next last time? Attend to that."* It is the leading mechanistic account of
+in-context learning (Olsson et al., 2022). Feed the model a random token sequence
+repeated twice and measure where each of the 96 heads looks. Random tokens matter:
+the model cannot fall back on memorized English, so any copying comes from context.
 
 ![Induction score by head](docs/images/induction_heads.png)
 
-| Head | Attention on the induction target | std over 16 sequences | vs uniform |
+| Head | Attention on the induction target | std | vs uniform |
 |---|---|---|---|
 | **L6.H9** | 0.4188 | 0.0397 | **29.5x** |
 | **L7.H8** | 0.2738 | 0.0341 | **19.3x** |
 | everything else | ~0.014 | | ~1x |
 
-`L6.H9` puts 42% of its attention mass on a single position out of fifty-plus, and
-the effect is about 10x its own standard deviation across sequences.
+`L6.H9` puts 42% of its attention mass on one position out of fifty-plus.
 
 **It is induction, not duplicate detection.** A head attending to the *same*
-token's earlier occurrence would be a duplicate-token head, which notices
-repetition without predicting anything. Measured on the same sequences, L6.H9
-puts 0.4188 on the next token against **0.0136** on the same token, a factor of
-**31**.
+earlier token would be a duplicate-token head, which notices repetition without
+predicting. L6.H9 puts 0.4188 on the next token against 0.0136 on the same token,
+a factor of **31**. Varying the repeat period across 32/48/56 moves the score only
+**8%**, so it is matching on content rather than counting to a fixed offset.
 
-### The heads are causally necessary, not decorative
-
-Attention patterns are correlational. So both heads were ablated, by zeroing
-their slice of the attention output, and the model re-measured:
-
-| | Loss, 1st copy | Loss, 2nd copy | In-context benefit |
-|---|---|---|---|
-| Intact | 12.7327 | 8.3056 | **4.4271 nats** |
-| Both heads ablated | 13.0137 (+0.28) | 12.2145 (**+3.91**) | 0.5182 |
+### The heads are causally necessary
 
 | Intervention | 2nd-copy loss change | 95% CI | Copying destroyed |
 |---|---|---|---|
 | **Mean ablation** (field standard) | **+3.3473** | [+3.2306, +3.4697] | **85.4%** |
 | Zero ablation | +3.9089 | [+3.7656, +4.0438] | 99.7% |
 
-**Ablating 2 of 96 heads destroys 85.4% of the model's repeated-sequence
-copying**, against a size-matched null of random head *pairs* at +0.0624 ± 0.1074:
-**30.6 standard deviations**. First-copy loss barely moves, so it is not general
-damage. Mean ablation is quoted rather than zero ablation because zeroing pushes
-the residual stream off-distribution and overstates (Zhang and Nanda, 2024).
+**Ablating 2 of 96 heads removes 85.4% of the model's repeated-sequence copying**,
+against a size-matched null of random head *pairs* at +0.0624 ± 0.1074:
+**30.6 standard deviations**. First-copy loss barely moves, so this is not general
+damage. Mean ablation is quoted because zeroing pushes the residual stream
+off-distribution and overstates (Zhang and Nanda, 2024).
 
-Two corrections a review forced, both of which made the result sharper:
+The denominator is corrected too: positions 48-95 have more context than 0-47
+whether or not anything repeats, and on non-repeated sequences that is worth
+**+0.51 nats**, so the real copying benefit is 3.92 rather than 4.43.
 
-- **The denominator needed a positional baseline.** Positions 48-95 have more
-  context than 0-47 whether or not anything repeats. On a *non*-repeated random
-  sequence that is worth **+0.51 nats**, so the true copying benefit is 3.92, not
-  4.43, and the ablation destroys 99.7% of it rather than 88.3%. The residual was
-  the artefact.
-- **It is copying, not "in-context learning".** Olsson et al. define the ICL score
-  on natural text; this measures verbatim copying of random tokens. Corrected
-  everywhere.
-- **Zero ablation overstated it.** Under mean ablation, the field-standard
-  intervention, the figure is 85.4% rather than 99.7%. The conclusion survives;
-  the number moves.
+### And it is a circuit, not two correlated heads
 
-### And it is a circuit, with parts in the right order
+An induction head cannot work alone. To find "the position after the previous B",
+something must first tag each position with what preceded it. That is a
+**previous-token head**, and it must run earlier.
 
-An induction head cannot work alone. To find "the position after the previous
-`B`", something must first tag each position with what preceded it. That is a
-**previous-token head**, and it has to run in an earlier layer.
+`L5.H11` does it, at 6.2x uniform, in layer 5, immediately below. Ablating it
+costs 1.25 nats, 28% of copying, while first-copy loss *improves*.
 
-| Head | Attention on position i-1 | vs uniform |
-|---|---|---|
-| **L5.H11** | 0.2420 | **6.2x** |
+The test that earns the word "circuit": ablate L5.H11 and re-measure the induction
+heads' **attention pattern**, not the loss.
 
-Layer 5, immediately below the induction heads in layers 6 and 7. The ordering the
-mechanism requires is exactly what the model has.
+| Head | Induction score, intact | With L5.H11 ablated | Fall |
+|---|---|---|---|
+| L6.H9 | 0.4188 | 0.2504 | **40.2%** |
+| L7.H8 | 0.2738 | 0.1671 | **39.0%** |
 
-Ablating it costs **1.25 nats, 28% of in-context learning**, while first-copy loss
-*improves* slightly (-0.07). So every part of the circuit is causally load-bearing:
+The upstream head is writing the tag the downstream heads match on. That is
+K-composition, and it is what makes this a mechanism with parts rather than two
+interesting heads.
 
-| Ablated | In-context learning lost |
-|---|---|
-| L5.H11 (previous-token) | 28.3% |
-| L6.H9 + L7.H8 (induction) | 88.3% |
+**The asymmetry is the interesting part.** The previous-token role is redundant
+(L2.H2, L2.H10, L3.H0 all do it partially), so removing L5.H11 leaves weaker
+copies behind. The induction role is not. Two heads do it, and removing both
+removes the capability.
 
-**The asymmetry is the interesting bit.** The previous-token role is redundant:
-L2.H2, L2.H10, L2.H6 and L3.H0 all show partial previous-token behaviour, so
-removing L5.H11 leaves weaker copies of the signal behind. The induction role is
-not redundant. Two heads do it, and removing both removes the capability.
-
-Method, controls, and limitations, including the ones a reviewer would raise:
+Method, controls, limitations, and 13 references:
 **[docs/INDUCTION_HEADS.md](docs/INDUCTION_HEADS.md)**.
 
 ```bash
 python induction_heads.py       --ckpt weights8b_300epoch.pth   # which heads
 python ablate_heads.py          --ckpt weights8b_300epoch.pth   # do they matter
-python previous_token_heads.py  --ckpt weights8b_300epoch.pth   # the other half
+python previous_token_heads.py  --ckpt weights8b_300epoch.pth   # the upstream head
+python circuit_controls.py      --ckpt weights8b_300epoch.pth   # the three controls
 ```
 
----
+## 5. Where this goes
 
-## The model itself
+The two halves sit oddly together, and that is the part worth pursuing. The
+training run was degraded in four separate ways and the model still built a clean,
+causally necessary induction circuit. As a claim that could be wrong:
 
-| | |
-|---|---|
-| Parameters | **134,077,440** trainable |
-| Architecture | 8 layers, 12 heads, 768 wide, GPT-2 BPE (50257), learned positions, untied head |
-| Corpus built | **8B tokens**, FineWeb-Edu, streamed and tokenized to a uint16 memmap |
-| Tokens consumed | **~1.0-1.2B**, agreed by two independent methods (see above) |
-| Held-out perplexity | **38.89** at context 128, on a disjoint Common Crawl snapshot |
-| WikiText-2 perplexity | **184.96**, against **59.69** for GPT-2-small on the identical harness |
-| Hardware | one NVIDIA Tesla P100, 16 GB, free Kaggle session |
-| Learning rate | 4e-4, fixed, no schedule (see the audit) |
-| Throughput | **10,200 tokens/sec**, **31.7% MFU** at batch 32 x 128, fp16 |
-| Peak GPU memory | **6.1 GB** of 16 GB |
+> **Induction-circuit formation is robust to substantial degradation of the
+> training setup.** Halving the context, removing the learning-rate schedule, and
+> training at roughly half the compute-optimal budget did not prevent the circuit
+> from forming or from carrying almost all of the model's copying ability.
 
-**This model loses to GPT-2-small by 3.1x on WikiText-2.** Stated up front, because
-a perplexity number without a reference measured the same way is not a claim
-anyone can check. `evaluate.py --model gpt2` runs GPT-2-small through the
-identical scoring function; the only thing that differs between those two rows is
-the model. That comparison also validates the harness: GPT-2-small's published
-~29.4 at context 1024 degrading to 59.69 at context 128 is the right direction
-and magnitude.
+**What would falsify it:** train the same architecture at context 32, or stop at
+100M tokens, and find no induction heads.
 
-Full detail, both protocols, and what remains unmeasured:
-**[docs/RESULTS.md](docs/RESULTS.md)**.
+**What is already known:** Olsson et al. found induction heads across every
+architecture and scale they examined, so the optimizer-axis version of this is
+probably not surprising. Chan et al. (2022) found the opposite along a different
+axis: in-context learning fails to emerge when burstiness and Zipfian marginals
+are removed from the data. So the open version of the question is about the
+**data distribution**, not the optimizer.
+
+**Why it matters:** if a capability like in-context learning emerges reliably even
+from badly configured training, you cannot suppress it by training carelessly. You
+have to be able to detect it afterwards. That is the argument for interpretability,
+and it is why this repo spends as much effort looking inside the model as building
+it.
+
+**The experiment I would run next** is the one this checkpoint cannot answer:
+Olsson et al. showed induction heads appear abruptly, in a narrow band of
+training. Seeing *when* the circuit formed needs checkpoints saved during
+training, which this run never saved. `train.py` now saves them.
 
 ## Verify any of it
 
@@ -243,28 +304,19 @@ python evaluate.py --model gpt2 --mode wikitext --max-length 128  # the GPT-2 ba
 ```
 
 The 23 tests include the analysis code, not just the model: that the captured
-attention exactly reproduces what `MultiHeadAttention` computes, that an
-untrained model shows no induction (so the probe is not measuring itself), that
-the ablation hook zeroes one head and no other, and that the audit recovers a
-planted context cliff.
+attention exactly reproduces what `MultiHeadAttention` computes, that an untrained
+model shows no induction (so the probe is not measuring itself), that the ablation
+hook zeroes one head and no other, and that the audit recovers a planted context
+cliff. A bug in the analysis produces a confident, plausible, wrong claim, which is
+much harder to notice than a loss that will not go down.
 
-**Needs the checkpoint.** It is 538 MB, past GitHub's 100 MB file limit, and
-**is not published yet**. `upload_to_hf.py` will put it on the Hugging Face Hub;
-until that runs, the four commands below cannot be reproduced by anyone but me,
-and this README says so rather than linking a page that has no file on it:
+**Needs the checkpoint.** It is 538 MB, past GitHub's 100 MB file limit, and **is
+not published yet**. `upload_to_hf.py` will put it on the Hugging Face Hub; until
+that runs, the commands in sections 3 and 4 cannot be reproduced by anyone but me,
+and this README says so rather than linking a page with no file behind it.
 
-```bash
-python audit_checkpoint.py      --ckpt weights8b_300epoch.pth   # the context bug
-python induction_heads.py       --ckpt weights8b_300epoch.pth   # the circuit
-python ablate_heads.py          --ckpt weights8b_300epoch.pth   # the causal test
-python previous_token_heads.py  --ckpt weights8b_300epoch.pth   # the upstream head
-```
-
-Every one of these runs on CPU in under two minutes. No GPU required to check any
-claim in this README.
-
-Example run logs, including the full artifact set every training run produces,
-are committed under [runs/](runs/).
+Every analysis command runs on CPU in under two minutes. No GPU is needed to check
+any claim here.
 
 ## The code
 
@@ -282,92 +334,38 @@ evaluate.py          perplexity, two protocols, GPT-2-small as an in-harness bas
 
 audit_checkpoint.py     recover architecture and true training context from raw weights
 induction_heads.py      probe every head for induction behaviour
-ablate_heads.py         zero a head and measure what the model loses, with controls
+ablate_heads.py         zero or mean ablation, size-matched controls, bootstrap CIs
 previous_token_heads.py find the other half of the circuit
+circuit_controls.py     K-composition, varied repeat period, positional baseline
 
-tests/               23 tests: 9 on the model and training loop, 14 on the analysis code
+tests/               23 tests: 9 on the model and training loop, 14 on the analysis
+runs/                per-run logs; the provenance the original run never kept
 notebooks/           the original Colab notebook, unedited, cited by the audit
 ```
 
 [docs/CODE_MAP.md](docs/CODE_MAP.md) says which code is verbatim from the original
 training notebook, which was restructured and why, and which was added afterwards.
 
-## How it was trained
-
-Three techniques, all present because of the 16 GB limit:
-
-**Gradient accumulation.** 32 micro-batches of 32 sequences accumulate before one
-optimizer step, giving the gradient quality of a 1024-sequence batch at the memory
-cost of 32. Measured peak memory is 6.1 GB of 16; without accumulation the same
-effective batch would need roughly 32x the activation memory and would not fit.
-
-**Mixed precision (fp16).** Halves activation memory. A gradient scaler multiplies
-the loss before backward so small gradients do not underflow, then unscales before
-the optimizer step.
-
-**Memory-mapped data.** The corpus is a flat uint16 array on disk. `np.memmap`
-pages in only the windows actually sampled, so training reads from an 8B-token
-file without loading it.
-
-```bash
-python tokenize_data.py --out train.bin      --max-tokens 1e9 --dump CC-MAIN-2024-10
-python tokenize_data.py --out validation.bin --max-tokens 5e6 --dump CC-MAIN-2024-18
-
-python train.py --train-bin train.bin --val-bin validation.bin \
-    --train-tokens 1e9 --lr 4e-4 --batch-size 32 --run-name baseline
-```
-
-Validation comes from a **different Common Crawl snapshot** than training, so it
-is distribution-matched but genuinely disjoint.
-
 ## What this is not
 
 - **Not an assistant.** No instruction tuning, no RLHF, no safety tuning.
 - **Not competitive.** It loses to GPT-2-small, a 2019 model, by 3.1x.
-- **Not a training trajectory.** The interpretability results are from one final
-  checkpoint. Showing *when* the induction circuit formed would need checkpoints
-  saved during training, which this run never saved. That is the honest gap.
-
-[SAMPLES.md](SAMPLES.md) has six unedited completions, chosen before I saw the
-output. They loop and get facts wrong, which is what 184.96 out-of-domain
-perplexity predicts.
+- **Not a training trajectory.** The interpretability results come from one final
+  checkpoint. When the circuit formed is the obvious next question and this run
+  cannot answer it.
+- **Not fully reproducible by a stranger yet**, until the checkpoint is published.
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [docs/AUDIT.md](docs/AUDIT.md) | six bugs, the proof for each, and what prevents them now |
-| [docs/INDUCTION_HEADS.md](docs/INDUCTION_HEADS.md) | the circuit: method, controls, limitations |
-| [docs/RESULTS.md](docs/RESULTS.md) | every measurement with the command that produces it |
-| [docs/CODE_MAP.md](docs/CODE_MAP.md) | what each file is, and which code is verbatim |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | every component, why it is there, parameter budget |
+| [docs/RESULTS.md](docs/RESULTS.md) | every measurement with the command that produces it |
+| [docs/AUDIT.md](docs/AUDIT.md) | six bugs, the proof for each, and what prevents them now |
+| [docs/INDUCTION_HEADS.md](docs/INDUCTION_HEADS.md) | the circuit: method, controls, limitations, references |
+| [docs/CODE_MAP.md](docs/CODE_MAP.md) | what each file is, and which code is verbatim |
 | [docs/CHANGES_FROM_NOTEBOOK.md](docs/CHANGES_FROM_NOTEBOOK.md) | line-level diff from the original notebook |
-| [docs/MEASURE.md](docs/MEASURE.md) | reproducing the throughput and memory numbers on a P100 |
-
-## What this suggests, stated as a hypothesis
-
-The two halves of this repo sit oddly together. The training run was degraded in
-four separate ways, and the model still built a clean, causally necessary
-induction circuit. Put as a claim that could be wrong:
-
-> **Induction-circuit formation is robust to substantial degradation of the
-> training setup.** Halving the context, removing the learning-rate schedule,
-> training at a flat rate, and sampling random windows with replacement did not
-> prevent the circuit from forming or from carrying almost all of the model's
-> in-context learning.
-
-**What would falsify it:** train the same architecture at context 32, or stop at
-100M tokens, and find no induction heads. If the circuit disappears under milder
-degradation than this run suffered, then it is not robust and this was luck.
-
-**Why it would matter:** if a capability like in-context learning emerges reliably
-even from badly configured training, you cannot suppress it by training carelessly.
-You have to be able to detect it after the fact. That is the argument for
-interpretability, and it is the reason this repo spends as much effort looking
-inside the model as it does training it.
-
-This experiment is **not run here**. The hypothesis is stated so that it can be
-attacked.
+| [docs/MEASURE.md](docs/MEASURE.md) | reproducing throughput and memory on a P100 |
 
 ## Attribution
 
@@ -375,9 +373,10 @@ The model implementation follows Sebastian Raschka's
 [Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch).
 The memory-mapped batch sampler and parts of the training loop follow Andrej
 Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT). Training data is
-[FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu).
-Perplexity uses the strided-window protocol from the GPT-2 paper. The induction
-head analysis follows Olsson et al.,
+[FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu). The
+interpretability analysis follows Elhage et al.,
+[A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html)
+and Olsson et al.,
 [In-context Learning and Induction Heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html).
 
 MIT licensed, see [LICENSE](LICENSE).
