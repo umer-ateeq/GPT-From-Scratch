@@ -1,8 +1,9 @@
-"""Tests that need no checkpoint and no dataset, so CI can run them for free.
+"""Tests that need no checkpoint and no dataset, so anyone can run them for free.
 
-Each one guards a property that was actually wrong at some point in this
-project's history (see docs/AUDIT.md). A test here is not decoration: every
-failure mode below cost real training time before it was found.
+Each one pins a property the rest of the repository's claims depend on: the
+parameter count, that attention cannot see the future, that every parameter
+receives gradient, and that the batch shape and learning rate come from the
+arguments they are given.
 
     python -m pytest tests/ -v
 """
@@ -14,8 +15,6 @@ import sys
 import numpy as np
 import pytest
 import torch
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import GPT_CONFIG_134M          # noqa: E402
 from data import get_batch                  # noqa: E402
@@ -158,7 +157,8 @@ def test_training_run_leaves_a_complete_record(tmp_path):
     rng.integers(0, 512, size=60_000, dtype=np.uint16).tofile(train_bin)
     rng.integers(0, 512, size=20_000, dtype=np.uint16).tofile(val_bin)
 
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pretrain")
     out_dir = tmp_path / "runs"
     result = subprocess.run(
         [sys.executable, "train.py",

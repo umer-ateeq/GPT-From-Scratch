@@ -32,10 +32,12 @@ import argparse
 
 import torch
 
-from ablate_heads import hooks_for, measure, split_loss
-from config import GPT_CONFIG_134M
-from induction_heads import induction_scores, uniform_baseline
-from model import load_checkpoint
+import _bootstrap  # noqa: F401  (puts pretrain/ on sys.path)
+
+from ablate_heads import hooks_for, measure, split_loss  # noqa: E402
+from config import GPT_CONFIG_134M  # noqa: E402
+from induction_heads import induction_scores, uniform_baseline  # noqa: E402
+from model import load_checkpoint  # noqa: E402
 
 
 def parse_args():

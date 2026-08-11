@@ -8,14 +8,9 @@ None of these need the released checkpoint or any dataset, so CI runs them free.
 
     python -m pytest tests/ -v
 """
-import os
-import sys
-
 import numpy as np
 import pytest
 import torch
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ablate_heads import make_ablation_hook, split_loss          # noqa: E402
 from audit_checkpoint import positional_embedding_audit          # noqa: E402

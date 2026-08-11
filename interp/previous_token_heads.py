@@ -37,9 +37,11 @@ import argparse
 
 import torch
 
-from config import GPT_CONFIG_134M
-from induction_heads import capture_attention
-from model import load_checkpoint
+import _bootstrap  # noqa: F401  (puts pretrain/ on sys.path)
+
+from config import GPT_CONFIG_134M  # noqa: E402
+from induction_heads import capture_attention  # noqa: E402
+from model import load_checkpoint  # noqa: E402
 
 
 def parse_args():

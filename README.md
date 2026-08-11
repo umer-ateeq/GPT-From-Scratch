@@ -1,9 +1,5 @@
 # GPT-134M: pretraining a transformer from scratch, then opening it up
 
-[![tests](https://github.com/umer-ateeq/GPT-From-Scratch/actions/workflows/tests.yml/badge.svg)](https://github.com/umer-ateeq/GPT-From-Scratch/actions/workflows/tests.yml)
-[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](requirements.txt)
-
 I wrote a 134M-parameter decoder-only transformer in PyTorch with no transformer
 library, built the streaming data pipeline that feeds it, and pretrained it on
 FineWeb-Edu for **~1.2B tokens** on a single free-tier Kaggle P100. Attention,
@@ -58,13 +54,47 @@ goes next.**
 | Positional rows allocated | 256 |
 | **Trained context** | **128** (established in section 3) |
 
-Every row was recovered from the checkpoint's own tensor shapes rather than
-copied from a config file, and `tests/test_model.py` asserts the parameter count
-exactly, so the headline number cannot drift from the code.
+Where the parameters live:
 
-Component-by-component reasoning, including the parameter budget and why each
-piece is there, is in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. The model
-is **[model.py](model.py)**, about 130 lines.
+| Component | Shape | Parameters |
+|---|---|---|
+| Token embedding | 50257 x 768 | 38,597,376 |
+| Positional embedding | 256 x 768 | 196,608 |
+| 8 transformer blocks | | 56,682,240 |
+| Final LayerNorm | | 1,536 |
+| Output head | 768 x 50257, no bias | 38,597,376 |
+| | **Total trainable** | **134,077,440** |
+
+The whole model is **[pretrain/model.py](pretrain/model.py)**, about 130 lines:
+
+```
+token ids                      (batch, tokens)
+   |
+   +-- token embedding         (batch, tokens, 768)
+   +-- positional embedding    (tokens, 768), broadcast and added
+   |
+  dropout
+   |
+   +--> TransformerBlock 1 ----+
+   |      LayerNorm            |
+   |      MultiHeadAttention   |  residual
+   |      dropout              |
+   |    <----------------------+
+   |      LayerNorm            |
+   |      FeedForward          |  residual
+   |      dropout              |
+   |    <----------------------+
+   |
+   ... 8 blocks total ...
+   |
+final LayerNorm
+   |
+output head (768 -> 50257)     (batch, tokens, 50257)
+```
+
+Logits at position `i` are the prediction for the token at `i + 1`, and the loss
+is cross-entropy over every position at once, so a batch of 32 x 128 contributes
+4,096 independent next-token predictions.
 
 Three choices worth calling out:
 
@@ -85,23 +115,24 @@ weights, which section 3 reads.
 
 ### The data pipeline
 
-FineWeb-Edu does not fit on a free notebook's disk, so it is **streamed** rather
-than downloaded, tokenized in chunks, and written straight into a pre-allocated
-memory-mapped `uint16` file. Peak RAM stays at roughly one chunk regardless of
-corpus size.
+FineWeb-Edu is **streamed** from Hugging Face rather than downloaded, tokenized
+with GPT-2 BPE as it arrives, and written straight into a `.bin` file as a
+memory-mapped `uint16` array. Streaming is what makes this work on a free
+notebook: the dataset never has to land on disk in full, and peak RAM stays at
+roughly one chunk no matter how many tokens get written.
 
 `uint16` is deliberate: GPT-2's vocabulary tops out at 50256, which fits in 16
-bits, so storing IDs as `int64` would have turned a 16 GB file into 64 GB for
-nothing.
+bits, so storing the IDs as `int64` would have made the file four times larger
+for nothing.
 
-Training data is `CC-MAIN-2024-10`. Validation comes from `CC-MAIN-2024-18`, a
+Training data comes from `CC-MAIN-2024-10`, validation from `CC-MAIN-2024-18`, a
 **different Common Crawl snapshot**, so held-out data is distribution-matched but
 genuinely disjoint.
 
 ```bash
 # --max-tokens is a disk budget, sized to the run you plan
-python tokenize_data.py --out train.bin      --dump CC-MAIN-2024-10 --max-tokens 2e9
-python tokenize_data.py --out validation.bin --dump CC-MAIN-2024-18 --max-tokens 5e6
+python pretrain/tokenize_data.py --out train.bin      --dump CC-MAIN-2024-10 --max-tokens 2e9
+python pretrain/tokenize_data.py --out validation.bin --dump CC-MAIN-2024-18 --max-tokens 5e6
 ```
 
 ### The training configuration
@@ -125,7 +156,7 @@ Everything the released checkpoint was trained with, in one place:
 | Throughput | 10,200 tokens/sec, 31.7% MFU |
 | Peak GPU memory | 6.12 GB of 16 GB |
 
-Every figure in that table is either recorded by `train.py` or recovered from the
+Every figure in that table is either recorded by `pretrain/train.py` or recovered from the
 checkpoint's weights in section 3. None of it is estimated.
 
 ### The decisions the hardware forced
@@ -142,26 +173,24 @@ iterations leaks the pages it touches.
 fp16 path. A `GradScaler` multiplies the loss before backward so small gradients
 do not underflow to zero, then unscales before the optimizer step. The unscaling
 has to happen *before* gradient clipping, or the clip normalizes gradients that
-are still in the scaled domain; `train.py` calls `scaler.unscale_(optimizer)`
-first for exactly that reason.
+are still in the scaled domain, which is why `pretrain/train.py` calls
+`scaler.unscale_(optimizer)` first.
 
 **Pinned asynchronous transfers.** Host-to-device copies overlap with compute
 rather than blocking on it.
 
 ```bash
-python train.py --train-bin train.bin --val-bin validation.bin \
+python pretrain/train.py --train-bin train.bin --val-bin validation.bin \
     --train-tokens 1e9 --lr 4e-4 --batch-size 32 --run-name baseline
 ```
 
 ### Every run leaves a record
 
-`train.py` writes its full configuration, git commit, seed, library versions, GPU
-name, launch command, per-eval metrics, throughput, MFU, peak memory and loss
-curve to `runs/`, and checkpoints embed their own config. Examples are committed
-there.
+`pretrain/train.py` writes its full configuration, git commit, seed, library
+versions, GPU name, launch command, per-eval metrics, throughput, MFU, peak
+memory and loss curve to a run folder, and checkpoints embed their own config.
 
-This is the part most from-scratch training repos skip, and it is the part that
-makes every number below checkable by someone who is not me.
+That is what makes every number below independently checkable.
 
 ## 2. What it does
 
@@ -176,9 +205,18 @@ makes every number below checkable by someone who is not me.
 ### The baseline is the point
 
 A perplexity number without a reference measured the same way is not a claim
-anyone can check. So `evaluate.py --model gpt2` pushes HuggingFace's GPT-2-small
-through the **identical scoring function, tokenizer, test set and window
-settings**. The only thing that differs between those two rows is the model.
+anyone can check. So `pretrain/evaluate.py --model gpt2` pushes HuggingFace's
+GPT-2-small through the **identical scoring function, tokenizer, test set and
+window settings**. The only thing that differs between those two rows is the
+model.
+
+Both models are scored on the full WikiText-2 raw test set, 285,396 tokens, at
+context 128 with non-overlapping windows so no token is counted twice:
+
+| Model | Params | NLL | Perplexity |
+|---|---|---|---|
+| **This model** | 134.08M | 5.2201 | **184.96** |
+| GPT-2-small | 124.44M | 4.0891 | **59.69** |
 
 Perplexity is lower-is-better, so **GPT-2-small wins that comparison by 3.10x**,
 which is what ~9 tokens per parameter predicts. GPT-2-small was trained on
@@ -193,7 +231,7 @@ evaluation code.
 The 4.8x gap between 38.89 in domain and 184.96 on WikiText-2 is what heavy
 domain specialization at this token budget looks like.
 
-### MFU, computed honestly
+### MFU
 
 Throughput only becomes comparable across hardware once converted to a fraction
 of the GPU's peak:
@@ -207,35 +245,31 @@ MFU             = 31.7%
 ```
 
 **The token embedding is excluded from N on purpose.** Reading a row of `tok_emb`
-is a gather, not a matrix multiply, so it costs no FLOPs. nanoGPT counts its
-embedding table only because its output head is *tied* to it: one parameter
-block, doing the work once. This model's head is untied, so `out_head` is a
-genuine 768 x 50257 matmul that belongs in N while `tok_emb` is a separate table
-of identical size that does not. Counting both would inflate the figure by about
-40% relative.
+is a gather, not a matrix multiply, so it costs no FLOPs. This model's head is
+untied, so `out_head` is a genuine 768 x 50257 matmul that belongs in N while
+`tok_emb` is a separate table of identical size that does not. Repos with a
+*tied* head count the embedding table once, because there it is the same
+parameter block doing the work.
 
-No nanoGPT comparison is offered, because their published MFU excludes embeddings
-under a tied head and the P100's compute-to-bandwidth ratio is roughly 8x lower
-than an A100's, which makes a high MFU *easier* to reach on this card. Quoting an
-A100 number beside a P100 number would flatter this one in two directions at
-once.
-
-[SAMPLES.md](SAMPLES.md) has six unedited completions from one seeded run, with
-the prompts fixed in source so they could not be chosen after the fact. They are
-locally fluent and factually unreliable, which is what 184.96 predicts.
-
-Full detail, both evaluation protocols, and what remains weakly evidenced:
-**[docs/RESULTS.md](docs/RESULTS.md)**.
+Every perplexity number above comes from `pretrain/evaluate.py`, which prints its
+dataset, protocol, window settings and scored token count on every run, so a
+figure always travels with the conditions that produced it.
 
 ## 3. Reading the training run out of the weights
 
-A checkpoint's configuration file is a claim. Its weights are evidence. This
-checkpoint arrived as a bare `state_dict`, 117 tensors with no config, no
-optimizer state and no metadata, so before reporting a single number from it I
-reconstructed the run it came from using nothing but the tensors.
+A configuration file is a claim about what a training run intended. The weights
+are evidence of what it did. Where the two disagree, the weights win, because
+they are the artifact you are actually shipping.
+
+So before reporting a single number from this checkpoint, I reconstructed its
+training configuration from the tensors alone: the trained context length, the
+number of optimizer steps, and the tokens consumed, each read out of a different
+part of the parameter space. The checkpoint is a bare `state_dict` of 117 tensors
+with no config attached, which is what makes the exercise worth doing rather than
+just reading a file.
 
 ```bash
-python audit_checkpoint.py --ckpt weights8b_300epoch.pth
+python interp/audit_checkpoint.py --ckpt weights8b_300epoch.pth
 ```
 
 ### The positional table records the trained context
@@ -258,14 +292,14 @@ and the boundary between them is legible directly in the weights:
          224-255      0.0023    0.0022    0.0024
 ```
 
-![Positional embedding row norms, a 93x cliff exactly at position 128](docs/images/pos_emb_norms.png)
+![Positional embedding row norms, a 93x cliff exactly at position 128](images/pos_emb_norms.png)
 
 A **93x cliff exactly at position 128**. The run trained at context 128 across
 256 allocated rows, and that is why every perplexity number in this repository is
 quoted at 128. Scoring at 256 puts half of every window on rows that never
 received gradient and roughly doubles perplexity, 38.89 against 74.70 on
 identical data, for reasons that have nothing to do with model quality.
-`evaluate.py` detects this from the weights and warns before printing.
+`pretrain/evaluate.py` detects this from the weights and warns before printing.
 
 ### The same rows count the optimizer steps
 
@@ -319,8 +353,12 @@ scaled, not trained. `tests/test_model.py` also plants a synthetic context cliff
 in a fresh model and asserts the audit recovers it, so the detector is tested
 against a known answer.
 
-Full derivation, every control, and what the method cannot establish:
-**[docs/AUDIT.md](docs/AUDIT.md)**.
+**What the clock cannot establish.** It counts successful steps only, so it is a
+lower bound on attempted ones. It needs a constant learning rate, because under a
+live schedule the same measurement returns the integral of the learning rate
+rather than the step count. And it needs weight decay applied to the embedding
+tables, so an optimizer configured to exclude embeddings from decay leaves no
+clock at all.
 
 ## 4. What is inside it: an induction circuit
 
@@ -339,7 +377,7 @@ context. Scores are averaged over 16 sequences and reported against a uniform
 baseline of 0.0142, the attention an indifferent causal head would put on any one
 position.
 
-![Induction score by head](docs/images/induction_heads.png)
+![Induction score by head](images/induction_heads.png)
 
 | Head | Attention on the induction target | std | vs uniform |
 |---|---|---|---|
@@ -391,6 +429,8 @@ attention the tag must be written before it can be matched.
 `L5.H11` does it, at 6.2x uniform, in layer 5, immediately below the induction
 heads in layers 6 and 7. Ablating it costs 1.25 nats, 28% of copying.
 
+![Previous-token score by head](images/prev_token_heads.png)
+
 The test that earns the word "circuit" is not the loss, it is the **attention
 pattern**: ablate L5.H11 and re-measure what the induction heads look at.
 
@@ -409,13 +449,13 @@ weaker copies behind. The induction role is not redundant. Two heads carry it,
 and removing both removes the capability.
 
 Method, every control, limitations and 13 references:
-**[docs/INDUCTION_HEADS.md](docs/INDUCTION_HEADS.md)**.
+**[interp/INDUCTION_HEADS.md](interp/INDUCTION_HEADS.md)**.
 
 ```bash
-python induction_heads.py       --ckpt weights8b_300epoch.pth   # which heads
-python ablate_heads.py          --ckpt weights8b_300epoch.pth   # do they matter
-python previous_token_heads.py  --ckpt weights8b_300epoch.pth   # the upstream head
-python circuit_controls.py      --ckpt weights8b_300epoch.pth   # the three controls
+python interp/induction_heads.py       --ckpt weights8b_300epoch.pth   # which heads
+python interp/ablate_heads.py          --ckpt weights8b_300epoch.pth   # do they matter
+python interp/previous_token_heads.py  --ckpt weights8b_300epoch.pth   # the upstream head
+python interp/circuit_controls.py      --ckpt weights8b_300epoch.pth   # the three controls
 ```
 
 ## 5. Where this goes
@@ -466,7 +506,7 @@ successors:
 - **Formation dynamics.** Olsson et al. showed induction heads appear abruptly,
   in a narrow band of training. Seeing *when* this circuit formed needs
   checkpoints saved during training, which the released run does not have.
-  `train.py` now saves them, so the next run answers it.
+  `pretrain/train.py` now saves them, so the next run answers it.
 
 ## Verify any of it
 
@@ -478,7 +518,7 @@ pip install -r requirements.txt
 
 ```bash
 python -m pytest tests/ -v                                        # 23 tests
-python evaluate.py --model gpt2 --mode wikitext --max-length 128  # the GPT-2 baseline
+python pretrain/evaluate.py --model gpt2 --mode wikitext --max-length 128  # the GPT-2 baseline
 ```
 
 The 23 tests cover the analysis code, not just the model: that captured attention
@@ -488,42 +528,40 @@ zeroes one head and no other, and that the audit recovers a planted context
 cliff. A bug in analysis code produces a confident, plausible, wrong claim, which
 is much harder to notice than a loss that will not go down.
 
-**Needs the checkpoint.** It is 538 MB, past GitHub's 100 MB file limit, and is
-**not published yet**. `upload_to_hf.py` will put it on the Hugging Face Hub;
-until that runs, the commands in sections 3 and 4 cannot be reproduced by anyone
-but me, and this README says so rather than linking a page with no file behind
-it.
+**Needs the checkpoint.** It is 538 MB, past GitHub's 100 MB file limit, so it
+ships on the Hugging Face Hub. The commands in sections 3 and 4 need those
+weights.
 
 Every analysis command runs on CPU in under two minutes. No GPU is needed to
 check any claim here.
 
 ## The code
 
+Two folders, in the order the work happened.
+
 ```
-model.py             LayerNorm, FeedForward, MultiHeadAttention, TransformerBlock,
-                     GPTModel. Written out, no transformer library
-config.py            every hyperparameter in one place
-data.py              memory-mapped batch sampling from a uint16 token file
-tokenize_data.py     stream a HuggingFace dataset into that token file
-train.py             mixed precision, gradient accumulation, warmup + cosine decay,
-                     clipping, resumable, MFU logging, full run records
-generate.py          greedy and temperature/top-k sampling
-evaluate.py          perplexity, two protocols, GPT-2-small as an in-harness baseline
+pretrain/    build it and train it
+  model.py             LayerNorm, FeedForward, MultiHeadAttention,
+                       TransformerBlock, GPTModel. No transformer library
+  config.py            every hyperparameter in one place
+  data.py              memory-mapped batch sampling from a uint16 token file
+  tokenize_data.py     stream a HuggingFace dataset into that token file
+  train.py             mixed precision, gradient accumulation, warmup + cosine
+                       decay, clipping, resumable, MFU logging, run records
+  generate.py          greedy and temperature/top-k sampling
+  evaluate.py          perplexity, two protocols, GPT-2-small as a baseline
 
-audit_checkpoint.py     recover architecture and trained context from raw weights
-induction_heads.py      probe every head for induction behaviour
-ablate_heads.py         zero or mean ablation, size-matched controls, bootstrap CIs
-previous_token_heads.py find the other half of the circuit
-circuit_controls.py     K-composition, varied repeat period, positional baseline
+interp/      read what is inside it
+  audit_checkpoint.py      recover architecture and trained context from weights
+  induction_heads.py       probe every head for induction behaviour
+  ablate_heads.py          zero and mean ablation, size-matched controls,
+                           bootstrap confidence intervals
+  previous_token_heads.py  find the other half of the circuit
+  circuit_controls.py      K-composition, varied repeat period, positional baseline
+  INDUCTION_HEADS.md       method, every control, limitations, 13 references
 
-tests/               23 tests: 9 on the model and training loop, 14 on the analysis
-runs/                per-run logs, config, metrics, loss curves
-notebooks/           the original Colab training notebook, unedited
+tests/       23 tests, 14 of them on the analysis code, no checkpoint needed
 ```
-
-[docs/CODE_MAP.md](docs/CODE_MAP.md) says which code is verbatim from the
-original training notebook, which was restructured and why, and which was written
-afterwards.
 
 ## Scope
 
@@ -538,18 +576,6 @@ afterwards.
 - **Not fully reproducible by a stranger yet**, until the checkpoint is
   published.
 
-## Documentation
-
-| Document | Contents |
-|---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | every component, why it is there, parameter budget |
-| [docs/RESULTS.md](docs/RESULTS.md) | every measurement with the command that produces it |
-| [docs/AUDIT.md](docs/AUDIT.md) | recovering the training run from the weights, with controls |
-| [docs/INDUCTION_HEADS.md](docs/INDUCTION_HEADS.md) | the circuit: method, controls, limitations, references |
-| [docs/CODE_MAP.md](docs/CODE_MAP.md) | what each file is, and which code is verbatim |
-| [docs/CHANGES_FROM_NOTEBOOK.md](docs/CHANGES_FROM_NOTEBOOK.md) | line-level diff from the original notebook |
-| [docs/MEASURE.md](docs/MEASURE.md) | reproducing throughput and memory on a P100 |
-
 ## Attribution
 
 The model implementation follows Sebastian Raschka's
@@ -561,5 +587,3 @@ interpretability analysis follows Elhage et al.,
 [A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html)
 and Olsson et al.,
 [In-context Learning and Induction Heads](https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html).
-
-MIT licensed, see [LICENSE](LICENSE).

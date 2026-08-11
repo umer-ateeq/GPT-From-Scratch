@@ -60,8 +60,10 @@ import argparse
 import torch
 import torch.nn.functional as F
 
-from config import GPT_CONFIG_134M
-from model import load_checkpoint
+import _bootstrap  # noqa: F401  (puts pretrain/ on sys.path)
+
+from config import GPT_CONFIG_134M  # noqa: E402
+from model import load_checkpoint  # noqa: E402
 
 
 def parse_args():

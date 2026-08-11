@@ -10,14 +10,12 @@ venv/
 *.bin
 *.bin.tmp
 
-# Model weights, including per-run checkpoints under runs/.
-# GitHub caps files at 100 MB and the released checkpoint is 538 MB.
+# Model weights. GitHub caps files at 100 MB; the released checkpoint is 538 MB.
 *.pth
 *.pt
 
-# The rest of a run folder (config.json, metrics.jsonl, summary.json,
-# loss_curve.png) IS committed. Those files are the provenance record and the
-# whole reason runs/ exists.
+# Training run output
+runs/
 
 # OS
 .DS_Store

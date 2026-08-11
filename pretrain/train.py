@@ -104,6 +104,10 @@ def parse_args():
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the model. Needs compute capability 7.0+; "
                         "skipped with a message on older cards such as the P100 (6.0)")
+    p.add_argument("--sdpa", action="store_true",
+                   help="use fused scaled_dot_product_attention instead of the "
+                        "notebook's explicit attention. Mathematically identical; "
+                        "only reaches the FlashAttention backend on sm_80+ hardware")
     p.add_argument("--fused-adam", action="store_true",
                    help="use the fused AdamW kernel. Small win here, since there is "
                         "one optimizer step per --grad-accum micro-batches")
@@ -519,6 +523,12 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         print(f"resumed from {args.resume}")
 
+    # Keep a handle on the uncompiled module. torch.compile returns a wrapper
+    # whose state_dict prefixes every key with "_orig_mod.", so a checkpoint
+    # saved from it cannot be loaded by GPTModel().load_state_dict() without
+    # stripping that prefix. Saving from raw_model avoids the whole problem.
+    raw_model = model
+
     if args.compile:
         # torch.compile's Triton backend requires a recent NVIDIA architecture
         # (Triton currently states compute capability 8.0+, i.e. Ampere). Rather
@@ -536,6 +546,11 @@ def main():
                 print(f"--compile ignored: {torch.cuda.get_device_name(0)} is "
                       f"sm_{major}{minor}, and torch.compile failed to initialise "
                       f"({type(e).__name__}: {e}). Training continues uncompiled.")
+
+    if args.sdpa:
+        from fast_attention import enable_sdpa
+        backend = enable_sdpa(model, device)
+        print(f"fused attention enabled, backend: {backend}")
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -567,7 +582,7 @@ def main():
         precision_dtype=precision_dtype,
     )
 
-    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+    torch.save({"model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),
                 "model_config": model_cfg, "args": vars(args),
                 "tokens_seen": stats["tokens_seen"]},
                os.path.join(logger.dir, "ckpt_last.pt"))

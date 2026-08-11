@@ -10,13 +10,14 @@ first occurrence. It is thought to be the main mechanism behind in-context
 learning in transformers (Olsson et al., *In-context Learning and Induction
 Heads*, Anthropic 2022).
 
-I wanted to know whether a small model, trained from scratch on a free GPU under
-a badly configured run, develops them at all.
+I wanted to know whether a 134M model, trained from scratch on a free-tier GPU
+at context 128 and roughly half the compute-optimal token budget, develops them
+at all.
 
 Reproduce:
 
 ```bash
-python induction_heads.py --ckpt weights8b_300epoch.pth --plot docs/images/induction_heads.png
+python interp/induction_heads.py --ckpt weights8b_300epoch.pth --plot images/induction_heads.png
 ```
 
 ## Method
@@ -40,7 +41,7 @@ puts `1/(i+1)` on any single one; averaged over the measured queries that is
 
 ## Result
 
-![Induction score by head](images/induction_heads.png)
+![Induction score by head](../images/induction_heads.png)
 
 | Head | Score | vs uniform |
 |---|---|---|
@@ -78,8 +79,8 @@ Now a later head can match on that tag and land on position 13.
 Two heads, two layers, in that order. With standard attention it cannot be done
 in one layer, because the tag has to be written before it can be matched.
 
-**That is narrower than it first appears, and an earlier version of this document
-overstated it.** Olsson et al. ran a "smeared keys" experiment in which each head's
+**That constraint is narrower than it first appears, and the narrow version is
+the one this document claims.** Olsson et al. ran a "smeared keys" experiment in which each head's
 key is a learned mixture of the current and previous token's key, and a *one-layer*
 model built that way does form induction heads. So the constraint is on standard
 attention, not on induction as such. There is also a second route this model could
@@ -92,10 +93,10 @@ So the circuit predicts a previous-token head somewhere before layer 6. There is
 one:
 
 ```bash
-python previous_token_heads.py --ckpt weights8b_300epoch.pth
+python interp/previous_token_heads.py --ckpt weights8b_300epoch.pth
 ```
 
-![Previous-token score by head](images/prev_token_heads.png)
+![Previous-token score by head](../images/prev_token_heads.png)
 
 | Head | Attention on position i-1 | vs uniform |
 |---|---|---|
@@ -118,7 +119,7 @@ heads: a mechanism with parts, an order they have to run in, and a reason why.
 The same ablation was run on L5.H11:
 
 ```bash
-python ablate_heads.py --ckpt weights8b_300epoch.pth --heads 5.11
+python interp/ablate_heads.py --ckpt weights8b_300epoch.pth --heads 5.11
 ```
 
 | | Loss, 1st copy | Loss, 2nd copy | In-context benefit lost |
@@ -175,7 +176,7 @@ and contribute nothing to the output. So the two heads were ablated and the
 model re-measured.
 
 ```bash
-python ablate_heads.py --ckpt weights8b_300epoch.pth
+python interp/ablate_heads.py --ckpt weights8b_300epoch.pth
 ```
 
 **The experiment.** Feed the model `[seq, seq]` with random tokens. On the first
@@ -212,8 +213,9 @@ poking the network: the model is just as good as before at the thing that does
 not require copying, and almost entirely unable to do the thing that does.
 
 **Control, size-matched.** The treatment removes two heads, so the null removes
-random *pairs*, drawn from heads with no induction role. Comparing a two-head
-ablation against one-head controls, as an earlier version did, inflates the ratio:
+random *pairs*, drawn from heads with no induction role. The control has to match
+the treatment in size: comparing a two-head ablation against one-head controls
+inflates the ratio for free.
 
 | Head pair | Change in 2nd-copy loss |
 |---|---|
@@ -228,16 +230,16 @@ ablation against one-head controls, as an earlier version did, inflates the rati
 Under mean ablation the treatment costs +3.3473 nats against a null of
 +0.0624 ± 0.1074, which puts it **30.6 standard deviations above the null mean**,
 and the low end of its confidence interval still clears the worst control by more
-than 13x. Reporting a z-score against the null's spread is more honest than
-dividing by a near-zero signed mean, which an earlier version did and which can be
-inflated arbitrarily.
+than 13x. The effect is reported as a z-score against the null's spread rather
+than as a ratio to the null's mean, because that mean is signed and near zero, so
+a ratio against it can be inflated arbitrarily.
 
 ## Two controls that could have killed this, and did not
 
-Both come from an adversarial review of this repository and are reproducible with:
+Both are reproducible with:
 
 ```bash
-python circuit_controls.py --ckpt weights8b_300epoch.pth
+python interp/circuit_controls.py --ckpt weights8b_300epoch.pth
 ```
 
 ### Is the "circuit" a circuit, or two correlated heads?
@@ -292,9 +294,10 @@ repeated natural text would be a useful complement.
 **This is one checkpoint, not a training trajectory.** Olsson et al. found that
 induction heads appear abruptly, in a narrow band of training, and that the
 appearance coincides with a jump in in-context learning ability. That result
-needs checkpoints saved *during* training, which this run does not have, because
-it recorded nothing (audit bug 4). Analysing the final checkpoint says the
-circuit exists; it says nothing about when it formed.
+needs checkpoints saved *during* training, which this run does not have
+(the original run saved no intermediate checkpoints). Analysing the final checkpoint says the
+circuit exists; it says nothing about when it formed. `train.py` now saves
+per-interval checkpoints, so the next run can answer it.
 
 **Ablation is zeroing, not resampling.** Zeroing a head's output moves the
 residual stream off the distribution the rest of the network expects. Mean
@@ -303,12 +306,12 @@ is the more careful control and would tighten the claim.
 
 ## Why this is in a pretraining repo
 
-The rest of this project is about whether the training run did what it claimed.
-[AUDIT.md](AUDIT.md) recovers what actually happened from the statistics of the
-weights. This asks a different question of the same weights: not *was it trained
-correctly* but *what did it learn*.
+Section 3 of the [README](../README.md) recovers the training configuration from the statistics of
+the weights. This document asks a different question of the same weights: not
+*what was it trained with* but *what did it learn*.
 
-Both come from the same habit of not taking a model's word for what it is.
+Both are the same method applied to different questions. Do not accept a
+description of a model, measure the artifact.
 
 ## References
 
@@ -366,9 +369,9 @@ departs from it, the departure is named above.
 - Chan, S. C. Y., Santoro, A., Lampinen, A., et al. (2022). *Data Distributional
   Properties Drive Emergent In-Context Learning in Transformers.* The known
   **negative** result: ICL fails to emerge when burstiness and Zipfian marginals
-  are removed. So the honest positioning is robust along the optimizer and
-  context-length axes this run degraded, fragile along the data-distribution axis
-  it did not touch.
+  are removed. So the correct positioning of this repository's claim is: robust
+  along the optimizer and context-length axes this run constrained, and untested
+  along the data-distribution axis it did not vary.
 - Bietti, A., Cabannes, V., Bouchacourt, D., Jegou, H., Bottou, L. (2023).
   *Birth of a Transformer: A Memory Viewpoint.*
 - Nanda, N., Bloom, J. (2022). *TransformerLens.* The reference implementation of
