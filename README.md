@@ -100,10 +100,10 @@ metrics, throughput, peak memory and loss curve to `runs/`.
 | WikiText-2 | 184.96 | 128 |
 
 
-### GPT-2-small on the identical harness
+### GPT-2-small Comparison:
 
 | Model | Params | Perplexity |
-|---|---|---|---|
+|---|---|---|
 | This model | 134.08M | **184.96** |
 | GPT-2-small | 124.44M | **59.69** |
 
