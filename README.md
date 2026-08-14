@@ -375,43 +375,45 @@ python interp/circuit_controls.py      --ckpt weights8b_300epoch.pth
 
 ## 6. What is next
 
-Both sections above read something out of the weights. The direction I want is
-harder: can a model **report** on its own internals, and is the report true?
-Self-report is the cheapest monitoring interface there is, and it is known to be
-unfaithful. Models deny using a hint that ablation proves they used (Turpin et al.,
-2023).
+Everything above measures a head from the outside. What strikes me about the results
+is that the two functions I found are **simple enough to write down**:
 
-The bottleneck is not the verbalization. It is the **ground truth**: you cannot
-score a report about an activation until you know what was in it. That ground truth
-comes from probe readouts, feature activations, and measured ablation and patching
-effects. It is the half I have been building. `ablate_heads.py` already reads and
-overwrites activations through forward hooks, with a size-matched null and bootstrap
-CIs, on a model I can account for down to the optimizer step.
+```python
+previous_token(i)  ->  attend to position i - 1
+induction(i, ctx)  ->  attend to the position after the previous occurrence of ctx[i]
+```
+
+Those are two lines of Python. If `L5.H11` really implements the first and `L6.H9`
+implements the second, then the obvious question is not "what does this head do" but
+**"what happens if I substitute the program for the head?"** A measurement tells you a
+head resembles a function. A substitution tells you whether the resemblance is load
+bearing, and it costs a number you can quote: the change in perplexity.
+
+That question is the direction I want to work in. It is a different bet from post-hoc
+interpretability. Rather than training an opaque model and reverse-engineering it
+afterwards, you ask which parts of it could have been written by hand in the first
+place, and what you give up by doing so.
+
+Concretely, the next things to build on this repository:
 
 | Next | Why it, and why now |
 |---|---|
-| **Linear probes** on the residual stream | Start where the answer is known. Previous-token behaviour is spread across L2.H2, L2.H10, L3.H0 and L5.H11, so the prediction is a *shape*, not a binary: probe accuracy for the previous token at chance in layer 0, rising by layers 2-3, rising again after 5. The causal cross-check is that ablating L5.H11 should cost accuracy at layer 6 and not at layer 3. Same discipline as the planted-cliff test in `tests/`: validate the detector against an answer you already know. |
-| **Activation patching** | Ablation shows a head is necessary. Patching shows which downstream components its output reaches, which is exactly what separates K-composition from the generic causal dependence measured above. |
-| **Sparse autoencoders** on residual and MLP activations | Turns "which head" into "which feature". At 134M this trains on the same free GPU. |
-| **Self-report faithfulness** | With probes and features in place, the internals label themselves. In-context first, no training: how much can a model already say about a feature a probe says is active? Then fine-tune on those labels and test generalization to unseen inputs and unseen features. |
-
-**How the two halves join.** A faithfulness claim is only defined when the report and
-the measured activation come from the same forward pass of the same model, so the
-experiment itself has to run inside one instruction-tuned model with its own probes
-and its own SAE. This 134M model is not that model: it is a base model and cannot
-answer questions about itself. Its role is the substrate where the measurement half
-gets built and validated against known answers, on something small enough to probe
-end to end on a CPU, specified down to the optimizer step, and mine.
+| **Programmatic substitution** | Replace the attention *pattern* of `L5.H11`, `L6.H9` and `L7.H8` with the exact programs above and measure the perplexity cost on held-out FineWeb-Edu. The controls are already here: a size-matched null of randomly chosen heads says what generic substitution costs, so the interesting number is the difference. |
+| **Substitution vs ablation** | Ablation removes a head. Substitution replaces it with something legible. If a head can be substituted much more cheaply than it can be ablated, the pattern was the thing doing the work; if the two costs are similar, the head's value is in its OV path, not where it looks. |
+| **Programmatic initialisation** | Install those patterns in a fresh model at init and compare convergence against an unconstrained baseline. This is where owning the training loop matters: it is a change to `train.py`, not to someone else's checkpoint. |
+| **Linear probes** on the residual stream | Start where the answer is known. Probe accuracy for the previous token should sit at chance in layer 0 and rise across the layers where previous-token heads appear, and ablating `L5.H11` should cost accuracy downstream of it but not upstream. Same discipline as the planted-cliff test in `tests/`: validate the detector against an answer you already have. |
 
 Two experiments this repository is set up for, neither run yet. **Formation
 dynamics**: induction heads appear abruptly during training, and seeing when this one
 formed needs weights saved *during* the run. The released checkpoint kept only its
-final state, so this needs a rerun; `train.py --save-every N` now keeps them. **The
-data-distribution experiment**: Chan et al. (2022) showed in-context learning fails to
-emerge when burstiness and Zipfian marginals are stripped from the data. The
-tokenizer, the streaming pipeline and the training loop are all here, so that
-ablation is 1.2B tokens at the 10,200 tok/s this run measured, about **33 hours** on
-the same free GPU.
+final state, so this needs a rerun; `train.py --save-every N` now keeps them. This is
+the same question as programmatic initialisation seen from the other end: if a
+pattern emerges abruptly on its own, installing it at the start is the intervention
+that tests whether the emergence was the bottleneck. **The data-distribution
+experiment**: Chan et al. (2022) showed in-context learning fails to emerge when
+burstiness and Zipfian marginals are stripped from the data. The tokenizer, the
+streaming pipeline and the training loop are all here, so that ablation is 1.2B
+tokens at the 10,200 tok/s this run measured, about **33 hours** on the same free GPU.
 
 ## 7. Run it
 
