@@ -17,7 +17,8 @@ at all.
 Reproduce:
 
 ```bash
-python interp/induction_heads.py --ckpt weights8b_300epoch.pth --plot images/induction_heads.png
+python interp/induction_heads.py --ckpt weights8b_300epoch.pth --n-seqs 32 \
+    --plot images/induction_heads.png
 ```
 
 ## Method
@@ -167,18 +168,45 @@ about as clean a control as this experiment can produce: the head contributes
 nothing to ordinary prediction and a great deal to copying.
 
 **The upstream head matters less than the downstream ones (32% against 99.7% under
-the same intervention), and that asymmetry is worth an explanation.** The most
-likely one is redundancy: L2.H2, L2.H10, L2.H6 and L3.H0 all show partial
-previous-token behaviour by attention score, so removing L5.H11 may leave weaker
-copies of the same signal for the induction heads to match on, whereas only two
-heads carry the induction role.
+the same intervention), and that asymmetry is worth an explanation.** The obvious
+one is redundancy: L2.H2, L2.H10, L2.H6 and L3.H0 all show partial previous-token
+behaviour by attention score, so removing L5.H11 may leave weaker copies of the
+same signal for the induction heads to match on, whereas only two heads carry the
+induction role.
 
-**This explanation is not yet tested.** The evidence for the redundant first stage
-is attention scores, and this document argues two sections down that attention
-scores are correlational. The experiment that would settle it is a joint ablation
-of the previous-token set, `--heads 5.11 2.2 2.10 3.0`, which has not been run.
-Until it is, "redundant first stage, bottleneck second stage" is a hypothesis
-consistent with the numbers rather than a result.
+**That explanation was tested and did not survive.** The experiment is a joint
+ablation of the previous-token set, run under **mean** ablation so it is comparable
+with an L5.H11 row measured the same way rather than with the zero-ablation table
+above:
+
+```bash
+python interp/ablate_heads.py --ckpt weights8b_300epoch.pth --ablation mean --heads 5.11
+python interp/ablate_heads.py --ckpt weights8b_300epoch.pth --ablation mean \
+    --heads 5.11 2.2 2.10 3.0
+```
+
+| Ablated, mean | Loss, 2nd copy | In-context benefit lost | Size-matched null |
+|---|---|---|---|
+| L5.H11 | +1.2185 | **31.1%** | +0.031 |
+| L5.H11 + L2.H2 + L2.H10 + L3.H0 | +1.4437 | **36.8%** | +0.090 |
+
+Three extra heads buy 5.7 points. Over the same change the size-matched null rises
+from +0.031 to +0.090, because the null is matched to the number of heads removed
+and removing four heads costs more than removing one whatever those heads do. Most
+of the 5.7 is that generic cost, not a recovered previous-token signal.
+
+**So the previous-token contribution to copying is concentrated in L5.H11**, not
+distributed across the layer-2 and layer-3 heads that share its attention
+signature. The redundancy story is out, and with it the tidy reading of the
+asymmetry. What survives ablating L5.H11 is about 60% of the induction pattern
+(see *Is the "circuit" a circuit, or two correlated heads?* below), and this
+document does not identify where that residual comes from. Saying so is more useful
+than the tidier story.
+
+One caveat on the set: the joint ablation removed L2.H2, L2.H10 and L3.H0 alongside
+L5.H11, but **not L2.H6**, which scores 4.0x and sits between L2.H10 and L3.H0. The
+head was left out of the run rather than excluded for a reason, so the result bounds
+the contribution of three of the four candidates, not all four.
 
 **Only 2 heads out of 96, about 2%, show strong induction.** The rest are doing
 something else entirely, or nothing legible by this measure. The model has enough
@@ -329,9 +357,14 @@ which nothing in this repository does. What is established here is causal
 dependence of the induction pattern on the previous-token head, with the
 key-composition route being the mechanism that predicts it.
 
-The pattern does not fall to the uniform baseline (0.0142), which is consistent
-with the redundancy hypothesis above, since L2.H2, L2.H10 and L3.H0 still supply a
-weaker version of the same signal.
+The pattern does not fall to the uniform baseline (0.0142), and the obvious
+explanation, that L2.H2, L2.H10 and L3.H0 still supply a weaker version of the same
+signal, is the one the joint ablation above rules out: those heads add almost
+nothing to the copying benefit once the null is size-matched. That leaves the
+residual 60% of the pattern unaccounted for. The two measurements are not the same
+quantity, since the joint ablation reads loss and this one reads attention, so a
+contribution to the pattern too small to move the loss is not excluded. Isolating
+it needs path patching, which is not built here.
 
 ### Is it induction, or a fixed positional offset?
 

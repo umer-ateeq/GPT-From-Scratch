@@ -2,7 +2,7 @@
 
 Every component is written out in pytorch. Multi-head attention, the causal mask,
 LayerNorm, the feed-forward block and the block wiring are in
-**[pretrain/model.py](pretrain/model.py)**, 190 lines; the sampler is in
+**[pretrain/model.py](pretrain/model.py)**, 151 lines; the sampler is in
 [generate.py](pretrain/generate.py) and the training loop in
 [train.py](pretrain/train.py). No `nn.Transformer`, no HuggingFace model class, no
 `x-transformers`. PyTorch tensors and nothing above them. The architecture follows
@@ -242,8 +242,11 @@ This section is the beginning of an interpretability track, not a finished one. 
 number below is measured and controlled; the claims are deliberately kept to what the
 measurements support, and what they do not support is named.
 
-**All figures: 32 random sequences of length 48 repeated twice, seed 123, on CPU,
-from the single released checkpoint.**
+**All induction and ablation figures: 32 random sequences of length 48 repeated
+twice, seed 123, on CPU, from the single released checkpoint.** `ablate_heads.py`
+and `circuit_controls.py` use that setting by default; `induction_heads.py` defaults
+to 16, so the command below passes `--n-seqs 32` explicitly. The previous-token
+probe runs at its own default, 16 sequences of length 96, since it needs no repeat.
 
 ### Two heads out of 96 do induction
 
@@ -367,8 +370,19 @@ Full method, all controls, 13 references:
 **[interp/INDUCTION_HEADS.md](interp/INDUCTION_HEADS.md)**.
 
 ```bash
-python interp/induction_heads.py       --ckpt weights8b_300epoch.pth
-python interp/ablate_heads.py          --ckpt weights8b_300epoch.pth --ablation mean
+# the induction table, and the duplicate-token control
+python interp/induction_heads.py       --ckpt weights8b_300epoch.pth --n-seqs 32
+
+# the 85.4%, its null and its CI. Mean ablation is not the default, so it is passed
+python interp/ablate_heads.py --ckpt weights8b_300epoch.pth --ablation mean
+
+# the upstream head alone, +1.22 nats and 31.1%
+python interp/ablate_heads.py --ckpt weights8b_300epoch.pth --ablation mean --heads 5.11
+
+# the four previous-token heads together, 36.8%
+python interp/ablate_heads.py --ckpt weights8b_300epoch.pth --ablation mean \
+    --heads 5.11 2.2 2.10 3.0
+
 python interp/previous_token_heads.py  --ckpt weights8b_300epoch.pth
 python interp/circuit_controls.py      --ckpt weights8b_300epoch.pth
 ```
